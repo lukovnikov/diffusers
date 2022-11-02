@@ -115,14 +115,6 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         "LMSDiscreteScheduler",
         "EulerDiscreteScheduler",
         "EulerAncestralDiscreteScheduler",
-    ]
-
-    _compatible_classes = [
-        "PNDMScheduler",
-        "DDPMScheduler",
-        "LMSDiscreteScheduler",
-        "EulerDiscreteScheduler",
-        "EulerAncestralDiscreteScheduler",
         "DPMSolverMultistepScheduler",
     ]
 
@@ -139,7 +131,9 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         steps_offset: int = 0,
     ):
         if trained_betas is not None:
-            self.betas = torch.from_numpy(trained_betas)
+            self.betas = (
+                torch.from_numpy(trained_betas) if not isinstance(trained_betas, torch.Tensor) else trained_betas
+            )
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":

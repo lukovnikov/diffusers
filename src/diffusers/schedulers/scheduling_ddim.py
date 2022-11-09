@@ -75,6 +75,16 @@ def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999) -> torch.Tensor
     return torch.tensor(betas)
 
 
+def _ddim_scheduler_from_ddpm_scheduler(sched):
+    ret = DDIMScheduler(
+        num_train_timesteps=sched.num_train_timesteps,
+        trained_betas=sched.betas,
+        clip_sample=sched.clip_sample,
+    )
+    assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
+    return ret
+
+
 class DDIMScheduler(SchedulerMixin, ConfigMixin):
     """
     Denoising diffusion implicit models is a scheduler that extends the denoising procedure introduced in denoising
@@ -163,16 +173,6 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         # setable values
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
-
-    @classmethod
-    def from_ddpm_scheduler(cls, sched):
-        ret = cls(
-            num_train_timesteps=sched.num_train_timesteps,
-            trained_betas=sched.betas,
-            clip_sample=sched.clip_sample,
-        )
-        assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
-        return ret
 
     def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
         """

@@ -255,14 +255,14 @@ def main(args):
             block_out_channels=(128, 256, 256, 256),
             down_block_types=(
                 "DownBlock2D",
-                "AttnDownBlock2D",
+                "DownBlock2D",
                 "AttnDownBlock2D",
                 "AttnDownBlock2D",
             ),
             up_block_types=(
                 "AttnUpBlock2D",
                 "AttnUpBlock2D",
-                "AttnUpBlock2D",
+                "UpBlock2D",
                 "UpBlock2D",
             ),
         )

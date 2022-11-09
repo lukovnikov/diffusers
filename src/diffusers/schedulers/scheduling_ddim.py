@@ -192,7 +192,6 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         self,
         num_inference_steps: int,
         device: Union[str, torch.device] = None,
-        substeps_mode: str = "linear",
     ):
         """
         Sets the discrete timesteps used for the diffusion chain. Supporting function to be run before inference.
@@ -200,23 +199,16 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         Args:
             num_inference_steps (`int`):
                 the number of diffusion steps used when generating samples with a pre-trained model.
-            substeps_mode (`str`, *optional*, defaults to "linear"):
-                How the steps are selected in the DDIM sampler. When "linear", the selected steps are linearly spaced.
-                When quadratic, the step size grows with decreasing t, such that for noisier x_t, the steps are larger.
-
         """
-        if substeps_mode.startswith("l"):
-            # using linearly spaced steps
-            self.num_inference_steps = num_inference_steps
-            step_ratio = self.config.num_train_timesteps / self.num_inference_steps
-            # creates integer timesteps by multiplying by ratio
-            # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-            timesteps += self.config.steps_offset
+        # using linearly spaced steps
+        self.num_inference_steps = num_inference_steps
+        step_ratio = self.config.num_train_timesteps / self.num_inference_steps
+        # creates integer timesteps by multiplying by ratio
+        # casting to int to avoid issues when num_inference_step is power of 3
+        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        timesteps += self.config.steps_offset
 
-            self.timesteps = torch.from_numpy(timesteps).to(device)
-        else:
-            raise NotImplementedError("Substep modes other than 'linear' not implemented yet. ")
+        self.timesteps = torch.from_numpy(timesteps).to(device)
 
     def step(
         self,

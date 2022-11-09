@@ -46,7 +46,6 @@ class DDIMPipeline(DiffusionPipeline):
         use_clipped_model_output: Optional[bool] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        substeps_mode="linear",  # linear or quad(ratic)
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
@@ -69,9 +68,6 @@ class DDIMPipeline(DiffusionPipeline):
                 [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipeline_utils.ImagePipelineOutput`] instead of a plain tuple.
-            substeps_mode (`str`, *optional*, defaults to "linear"):
-                How the steps are selected in the DDIM sampler. When "linear", the selected steps are linearly spaced.
-                When quadratic, the step size grows with decreasing t, such that for noisier x_t, the steps are larger.
 
         Returns:
             [`~pipeline_utils.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if
@@ -87,7 +83,7 @@ class DDIMPipeline(DiffusionPipeline):
         image = image.to(self.device)
 
         # set step values
-        self.scheduler.set_timesteps(num_inference_steps, substeps_mode=substeps_mode)
+        self.scheduler.set_timesteps(num_inference_steps)
 
         # Ignore use_clipped_model_output if the scheduler doesn't accept this argument
         accepts_use_clipped_model_output = "use_clipped_model_output" in set(

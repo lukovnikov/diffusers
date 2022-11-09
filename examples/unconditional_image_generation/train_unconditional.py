@@ -252,14 +252,14 @@ def main(args):
             in_channels=3,
             out_channels=3,
             layers_per_block=3,
-            block_out_channels=(256, 256, 256),
+            block_out_channels=(128, 256, 256),
             down_block_types=(
                 "DownBlock2D",
                 "AttnDownBlock2D",
-                "AttnDownBlock2D",
+                "DownBlock2D",
             ),
             up_block_types=(
-                "AttnUpBlock2D",
+                "UpBlock2D",
                 "AttnUpBlock2D",
                 "UpBlock2D",
             ),

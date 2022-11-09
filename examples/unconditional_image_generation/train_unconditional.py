@@ -421,8 +421,8 @@ def main(args):
 
                 accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                assert accelerator.sync_gradients
+                accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 if args.use_ema:

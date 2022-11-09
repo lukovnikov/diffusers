@@ -47,14 +47,12 @@ def main(args):
                 generator=generator,
                 batch_size=args.batch_size,
                 output_type="numpy",
-                predict_epsilon=args.predict_mode == "eps",
             ).images
         elif args.sampler == "ddim":
             images = pipeline(
                 generator=generator,
                 batch_size=args.batch_size,
                 output_type="numpy",
-                predict_epsilon=args.predict_mode == "eps",
                 num_inference_steps=args.num_steps,
                 use_clipped_model_output=True,
                 eta=args.ddim_eta,

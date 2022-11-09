@@ -76,6 +76,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         out_channels: int = 3,
         center_input_sample: bool = False,
         time_embedding_type: str = "positional",
+        dropout: float = 0.,
         freq_shift: int = 0,
         flip_sin_to_cos: bool = True,
         down_block_types: Tuple[str] = ("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"),
@@ -92,6 +93,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         super().__init__()
 
         self.sample_size = sample_size
+        self.dropout = dropout
         time_embed_dim = block_out_channels[0] * 4
 
         # input
@@ -130,6 +132,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 resnet_groups=norm_num_groups,
                 attn_num_head_channels=attention_head_dim,
                 downsample_padding=downsample_padding,
+                dropout=dropout,
             )
             self.down_blocks.append(down_block)
 
@@ -143,6 +146,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             resnet_time_scale_shift="default",
             attn_num_head_channels=attention_head_dim,
             resnet_groups=norm_num_groups,
+            dropout=dropout,
         )
 
         # up
@@ -167,6 +171,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 resnet_act_fn=act_fn,
                 resnet_groups=norm_num_groups,
                 attn_num_head_channels=attention_head_dim,
+                dropout=dropout,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel

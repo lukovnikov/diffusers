@@ -8,13 +8,23 @@ from diffusers import DDIMPipeline, DDIMScheduler, DDPMPipeline
 from PIL import Image
 
 
+def _ddim_scheduler_from_ddpm_scheduler(sched):
+    ret = DDIMScheduler(
+        num_train_timesteps=sched.num_train_timesteps,
+        trained_betas=sched.betas,
+        clip_sample=sched.clip_sample,
+    )
+    assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
+    return ret
+
+
 def main(args):
     pipeline = DDPMPipeline.from_pretrained(args.load_dir).to(
         torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 else "cpu")
     )
 
     if args.sampler == "ddim":
-        ddimsched = DDIMScheduler.from_ddpm_scheduler(pipeline.scheduler)
+        ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler)
         pipeline = DDIMPipeline(pipeline.unet, ddimsched)
 
     num_steps = args.num_steps if args.num_steps != -1 else pipeline.scheduler.num_train_timesteps

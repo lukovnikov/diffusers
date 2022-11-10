@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 from typing import Optional
+import shutil
 
 import torch
 import torch.nn.functional as F
@@ -287,9 +288,8 @@ def main(args):
             in_channels=3,
             out_channels=3,
             layers_per_block=2,
-            block_out_channels=(128, 128, 256, 256, 512, 512),
+            block_out_channels=(128, 128, 256, 256, 256),
             down_block_types=(
-                "DownBlock2D",
                 "DownBlock2D",
                 "DownBlock2D",
                 "DownBlock2D",
@@ -299,7 +299,6 @@ def main(args):
             up_block_types=(
                 "UpBlock2D",
                 "AttnUpBlock2D",
-                "UpBlock2D",
                 "UpBlock2D",
                 "UpBlock2D",
                 "UpBlock2D",
@@ -480,14 +479,15 @@ def main(args):
                     "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
                 )
 
-            if args.store_model_epochs > 0 and epoch % args.store_model_epochs == 0:
-                # save the model
-                pipeline.save_pretrained(args.output_dir, suffix=f"_{epoch}ep")
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1 or args.store_model_epochs > 0 and epoch % args.store_model_epochs == 0:
                 # save the model
                 pipeline.save_pretrained(args.output_dir)
                 if args.push_to_hub:
                     repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
+
+            if args.store_model_epochs > 0 and epoch % args.store_model_epochs == 0:
+                # copy saved model
+                shutil.copytree(args.output_dir, args.output_dir + f"_{epoch}ep")
         accelerator.wait_for_everyone()
 
     accelerator.end_training()

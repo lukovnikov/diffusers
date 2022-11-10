@@ -162,7 +162,7 @@ class DiffusionPipeline(ConfigMixin):
             # set models
             setattr(self, name, module)
 
-    def save_pretrained(self, save_directory: Union[str, os.PathLike], suffix: str = ""):
+    def save_pretrained(self, save_directory: Union[str, os.PathLike]):
         """
         Save all variables of the pipeline that can be saved and loaded as well as the pipelines configuration file to
         a directory. A pipeline variable can be saved and loaded if its class implements both a save and loading
@@ -171,8 +171,6 @@ class DiffusionPipeline(ConfigMixin):
         Arguments:
             save_directory (`str` or `os.PathLike`):
                 Directory to which to save. Will be created if it doesn't exist.
-            suffix (`str`):
-                Suffix to append to saved pipeline elements.
         """
         self.save_config(save_directory)
 
@@ -203,7 +201,7 @@ class DiffusionPipeline(ConfigMixin):
                     break
 
             save_method = getattr(sub_model, save_method_name)
-            save_method(os.path.join(save_directory, pipeline_component_name + suffix))
+            save_method(os.path.join(save_directory, pipeline_component_name))
 
     def to(self, torch_device: Optional[Union[str, torch.device]] = None):
         if torch_device is None:

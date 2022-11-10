@@ -37,14 +37,12 @@ def main(args):
                 generator=generator,
                 batch_size=args.batch_size,
                 output_type="numpy",
-                predict_epsilon=args.predict_mode == "eps",
             ).images
         elif args.sampler == "ddim":
             images = pipeline(
                 generator=generator,
                 batch_size=args.batch_size,
                 output_type="numpy",
-                predict_epsilon=args.predict_mode == "eps",
                 num_inference_steps=args.num_steps,
                 use_clipped_model_output=True,
                 eta=args.ddim_eta,
@@ -76,7 +74,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--output_subdir", type=str, default="samples")
     parser.add_argument("--num_samples", type=int, default=10)
-    parser.add_argument("--predict_mode", type=str, default="eps")  # "eps" or "x0"
     parser.add_argument("--gpu", type=int, default=-1)
 
     args = parser.parse_args()

@@ -209,7 +209,13 @@ def parse_args():
         "--predict_epsilon",
         action="store_true",
         default=True,
-        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
+        help="Whether the model should predict the 'epsilon'/noise error. This is enabled by default.",
+    )
+    parser.add_argument(
+        "--predict_x0",
+        dest="predict_epsilon",
+        action="store_false",
+        help="Whether the model should predict directly the reconstructed image 'x0'. This flag is disabled by default."
     )
 
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)

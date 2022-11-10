@@ -76,7 +76,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         out_channels: int = 3,
         center_input_sample: bool = False,
         time_embedding_type: str = "positional",
-        dropout: float = 0.,
+        dropout: float = 0.0,
         freq_shift: int = 0,
         flip_sin_to_cos: bool = True,
         down_block_types: Tuple[str] = ("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"),

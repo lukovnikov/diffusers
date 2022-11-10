@@ -119,6 +119,15 @@ def parse_args():
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
     )
     parser.add_argument(
+        "--store_model_epochs",
+        type=int,
+        default=-1,
+        help=(
+            "How often to store the model during training. Different from --save_model_epoch, all these saved models"
+            " are retained after training."
+        ),
+    )
+    parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
@@ -133,7 +142,7 @@ def parse_args():
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.,
+        default=0.0,
         help="Dropout to be used during training (default=0).",
     )
     parser.add_argument(
@@ -465,6 +474,9 @@ def main(args):
                     "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
                 )
 
+            if args.store_model_epochs > 0 and epoch % args.store_model_epochs == 0:
+                # save the model
+                pipeline.save_pretrained(args.output_dir, suffix=f"_{epoch}ep")
             if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
                 # save the model
                 pipeline.save_pretrained(args.output_dir)

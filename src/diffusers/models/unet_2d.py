@@ -89,6 +89,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         attention_head_dim: int = 8,
         norm_num_groups: int = 32,
         norm_eps: float = 1e-5,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
 
@@ -133,6 +134,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 attn_num_head_channels=attention_head_dim,
                 downsample_padding=downsample_padding,
                 dropout=dropout,
+                use_scale_shift_norm=use_scale_shift_norm,
             )
             self.down_blocks.append(down_block)
 
@@ -147,6 +149,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             attn_num_head_channels=attention_head_dim,
             resnet_groups=norm_num_groups,
             dropout=dropout,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
 
         # up
@@ -172,6 +175,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 resnet_groups=norm_num_groups,
                 attn_num_head_channels=attention_head_dim,
                 dropout=dropout,
+                use_scale_shift_norm=use_scale_shift_norm,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel

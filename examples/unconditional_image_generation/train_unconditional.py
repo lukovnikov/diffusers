@@ -281,6 +281,7 @@ def main(args):
                 "UpBlock2D",
                 "UpBlock2D",
             ),
+            use_scale_shift_norm=True,
         )
     else:
         model = UNet2DModel(
@@ -303,6 +304,7 @@ def main(args):
                 "UpBlock2D",
                 "UpBlock2D",
             ),
+            use_scale_shift_norm=True,
         )
 
     print(f"Number of parameters: {count_parameters(model)//1e6:.2f}M")

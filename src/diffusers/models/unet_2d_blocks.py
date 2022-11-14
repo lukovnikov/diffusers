@@ -33,6 +33,7 @@ def get_down_block(
     cross_attention_dim=None,
     downsample_padding=None,
     dropout=0.0,
+    use_scale_shift_norm=False,
 ):
     down_block_type = down_block_type[7:] if down_block_type.startswith("UNetRes") else down_block_type
     if down_block_type == "DownBlock2D":
@@ -47,6 +48,7 @@ def get_down_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif down_block_type == "AttnDownBlock2D":
         return AttnDownBlock2D(
@@ -61,6 +63,7 @@ def get_down_block(
             resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
             attn_num_head_channels=attn_num_head_channels,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif down_block_type == "CrossAttnDownBlock2D":
         if cross_attention_dim is None:
@@ -78,6 +81,7 @@ def get_down_block(
             downsample_padding=downsample_padding,
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif down_block_type == "SkipDownBlock2D":
         return SkipDownBlock2D(
@@ -90,6 +94,7 @@ def get_down_block(
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
             downsample_padding=downsample_padding,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif down_block_type == "AttnSkipDownBlock2D":
         return AttnSkipDownBlock2D(
@@ -103,6 +108,7 @@ def get_down_block(
             resnet_act_fn=resnet_act_fn,
             downsample_padding=downsample_padding,
             attn_num_head_channels=attn_num_head_channels,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif down_block_type == "DownEncoderBlock2D":
         return DownEncoderBlock2D(
@@ -115,6 +121,7 @@ def get_down_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif down_block_type == "AttnDownEncoderBlock2D":
         return AttnDownEncoderBlock2D(
@@ -128,6 +135,7 @@ def get_down_block(
             resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
             attn_num_head_channels=attn_num_head_channels,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     raise ValueError(f"{down_block_type} does not exist.")
 
@@ -146,6 +154,7 @@ def get_up_block(
     resnet_groups=None,
     cross_attention_dim=None,
     dropout=0.0,
+    use_scale_shift_norm=False,
 ):
     up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
     if up_block_type == "UpBlock2D":
@@ -160,6 +169,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             dropout=dropout,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif up_block_type == "CrossAttnUpBlock2D":
         if cross_attention_dim is None:
@@ -177,6 +187,7 @@ def get_up_block(
             resnet_groups=resnet_groups,
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif up_block_type == "AttnUpBlock2D":
         return AttnUpBlock2D(
@@ -191,6 +202,7 @@ def get_up_block(
             resnet_groups=resnet_groups,
             attn_num_head_channels=attn_num_head_channels,
             dropout=dropout,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif up_block_type == "SkipUpBlock2D":
         return SkipUpBlock2D(
@@ -203,6 +215,7 @@ def get_up_block(
             add_upsample=add_upsample,
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif up_block_type == "AttnSkipUpBlock2D":
         return AttnSkipUpBlock2D(
@@ -216,6 +229,7 @@ def get_up_block(
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
             attn_num_head_channels=attn_num_head_channels,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif up_block_type == "UpDecoderBlock2D":
         return UpDecoderBlock2D(
@@ -227,6 +241,7 @@ def get_up_block(
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     elif up_block_type == "AttnUpDecoderBlock2D":
         return AttnUpDecoderBlock2D(
@@ -239,6 +254,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             attn_num_head_channels=attn_num_head_channels,
+            use_scale_shift_norm=use_scale_shift_norm,
         )
     raise ValueError(f"{up_block_type} does not exist.")
 
@@ -258,6 +274,7 @@ class UNetMidBlock2D(nn.Module):
         attn_num_head_channels=1,
         attention_type="default",
         output_scale_factor=1.0,
+        use_scale_shift_norm=False,
         **kwargs,
     ):
         super().__init__()
@@ -278,6 +295,7 @@ class UNetMidBlock2D(nn.Module):
                 non_linearity=resnet_act_fn,
                 output_scale_factor=output_scale_factor,
                 pre_norm=resnet_pre_norm,
+                use_scale_shift_norm=use_scale_shift_norm,
             )
         ]
         attentions = []
@@ -304,6 +322,7 @@ class UNetMidBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -338,6 +357,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         attention_type="default",
         output_scale_factor=1.0,
         cross_attention_dim=1280,
+        use_scale_shift_norm=False,
         **kwargs,
     ):
         super().__init__()
@@ -359,6 +379,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                 non_linearity=resnet_act_fn,
                 output_scale_factor=output_scale_factor,
                 pre_norm=resnet_pre_norm,
+                use_scale_shift_norm=use_scale_shift_norm,
             )
         ]
         attentions = []
@@ -386,6 +407,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -438,6 +460,7 @@ class AttnDownBlock2D(nn.Module):
         output_scale_factor=1.0,
         downsample_padding=1,
         add_downsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -459,6 +482,7 @@ class AttnDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
             attentions.append(
@@ -521,6 +545,7 @@ class CrossAttnDownBlock2D(nn.Module):
         output_scale_factor=1.0,
         downsample_padding=1,
         add_downsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -543,6 +568,7 @@ class CrossAttnDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
             attentions.append(
@@ -640,6 +666,7 @@ class DownBlock2D(nn.Module):
         output_scale_factor=1.0,
         add_downsample=True,
         downsample_padding=1,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -658,6 +685,7 @@ class DownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -718,6 +746,7 @@ class DownEncoderBlock2D(nn.Module):
         output_scale_factor=1.0,
         add_downsample=True,
         downsample_padding=1,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -736,6 +765,7 @@ class DownEncoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -779,6 +809,7 @@ class AttnDownEncoderBlock2D(nn.Module):
         output_scale_factor=1.0,
         add_downsample=True,
         downsample_padding=1,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -798,6 +829,7 @@ class AttnDownEncoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
             attentions.append(
@@ -853,6 +885,7 @@ class AttnSkipDownBlock2D(nn.Module):
         output_scale_factor=np.sqrt(2.0),
         downsample_padding=1,
         add_downsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         self.attentions = nn.ModuleList([])
@@ -875,6 +908,7 @@ class AttnSkipDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
             self.attentions.append(
@@ -901,6 +935,7 @@ class AttnSkipDownBlock2D(nn.Module):
                 use_in_shortcut=True,
                 down=True,
                 kernel="fir",
+                use_scale_shift_norm=use_scale_shift_norm,
             )
             self.downsamplers = nn.ModuleList([FirDownsample2D(out_channels, out_channels=out_channels)])
             self.skip_conv = nn.Conv2d(3, out_channels, kernel_size=(1, 1), stride=(1, 1))
@@ -944,6 +979,7 @@ class SkipDownBlock2D(nn.Module):
         output_scale_factor=np.sqrt(2.0),
         add_downsample=True,
         downsample_padding=1,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         self.resnets = nn.ModuleList([])
@@ -963,6 +999,7 @@ class SkipDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -981,6 +1018,7 @@ class SkipDownBlock2D(nn.Module):
                 use_in_shortcut=True,
                 down=True,
                 kernel="fir",
+                use_scale_shift_norm=use_scale_shift_norm,
             )
             self.downsamplers = nn.ModuleList([FirDownsample2D(out_channels, out_channels=out_channels)])
             self.skip_conv = nn.Conv2d(3, out_channels, kernel_size=(1, 1), stride=(1, 1))
@@ -1026,6 +1064,7 @@ class AttnUpBlock2D(nn.Module):
         attn_num_head_channels=1,
         output_scale_factor=1.0,
         add_upsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -1049,6 +1088,7 @@ class AttnUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
             attentions.append(
@@ -1105,6 +1145,7 @@ class CrossAttnUpBlock2D(nn.Module):
         attention_type="default",
         output_scale_factor=1.0,
         add_upsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -1129,6 +1170,7 @@ class CrossAttnUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
             attentions.append(
@@ -1228,6 +1270,7 @@ class UpBlock2D(nn.Module):
         resnet_pre_norm: bool = True,
         output_scale_factor=1.0,
         add_upsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -1248,6 +1291,7 @@ class UpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -1300,6 +1344,7 @@ class UpDecoderBlock2D(nn.Module):
         resnet_pre_norm: bool = True,
         output_scale_factor=1.0,
         add_upsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -1319,6 +1364,7 @@ class UpDecoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -1355,6 +1401,7 @@ class AttnUpDecoderBlock2D(nn.Module):
         attn_num_head_channels=1,
         output_scale_factor=1.0,
         add_upsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         resnets = []
@@ -1375,6 +1422,7 @@ class AttnUpDecoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
             attentions.append(
@@ -1425,6 +1473,7 @@ class AttnSkipUpBlock2D(nn.Module):
         output_scale_factor=np.sqrt(2.0),
         upsample_padding=1,
         add_upsample=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         self.attentions = nn.ModuleList([])
@@ -1449,6 +1498,7 @@ class AttnSkipUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -1478,6 +1528,7 @@ class AttnSkipUpBlock2D(nn.Module):
                 use_in_shortcut=True,
                 up=True,
                 kernel="fir",
+                use_scale_shift_norm=use_scale_shift_norm,
             )
             self.skip_conv = nn.Conv2d(out_channels, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
             self.skip_norm = torch.nn.GroupNorm(
@@ -1534,6 +1585,7 @@ class SkipUpBlock2D(nn.Module):
         output_scale_factor=np.sqrt(2.0),
         add_upsample=True,
         upsample_padding=1,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         self.resnets = nn.ModuleList([])
@@ -1555,6 +1607,7 @@ class SkipUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    use_scale_shift_norm=use_scale_shift_norm,
                 )
             )
 
@@ -1575,6 +1628,7 @@ class SkipUpBlock2D(nn.Module):
                 use_in_shortcut=True,
                 up=True,
                 kernel="fir",
+                use_scale_shift_norm=use_scale_shift_norm,
             )
             self.skip_conv = nn.Conv2d(out_channels, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
             self.skip_norm = torch.nn.GroupNorm(

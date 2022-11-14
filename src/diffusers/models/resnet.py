@@ -311,7 +311,7 @@ class ResnetBlock2D(nn.Module):
         kernel=None,
         output_scale_factor=1.0,
         use_in_shortcut=None,
-        use_scale_shift_norm=True,
+        use_scale_shift_norm=False,
         up=False,
         down=False,
     ):

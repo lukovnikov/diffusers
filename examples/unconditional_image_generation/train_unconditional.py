@@ -277,6 +277,7 @@ def main(args):
             in_channels=3,
             out_channels=3,
             layers_per_block=2,
+            dropout=args.dropout,
             block_out_channels=(128, 256, 256, 256),
             down_block_types=(
                 "DownBlock2D",
@@ -298,6 +299,7 @@ def main(args):
             in_channels=3,
             out_channels=3,
             layers_per_block=2,
+            dropout=args.dropout,
             block_out_channels=(128, 128, 256, 256, 256),
             down_block_types=(
                 "DownBlock2D",

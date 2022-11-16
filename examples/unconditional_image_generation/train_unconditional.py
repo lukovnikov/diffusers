@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Optional
 import shutil
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -149,7 +150,7 @@ def parse_args():
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="cosine",
+        default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
             ' "constant", "constant_with_warmup"]'
@@ -241,6 +242,14 @@ def parse_args():
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def compute_grad_norm(model):
+    sqsum = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            sqsum += (p.grad ** 2).sum().item()
+    return np.sqrt(sqsum)
 
 
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
@@ -438,6 +447,7 @@ def main(args):
                 accelerator.backward(loss)
 
                 assert accelerator.sync_gradients
+                gradnorm = compute_grad_norm(model)
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
@@ -450,7 +460,8 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0],
+                    "gradnorm": gradnorm, "step": global_step}
             if args.use_ema:
                 logs["ema_decay"] = ema_model.decay
             progress_bar.set_postfix(**logs)

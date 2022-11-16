@@ -127,7 +127,9 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
     ):
         if trained_betas is not None:
             self.betas = torch.from_numpy(trained_betas)
-        elif beta_schedule == "linear":
+        elif beta_schedule == "linear":     # match improved_diffusion implementation
+            # scale = 1000 / num_train_timesteps
+            # self.betas = torch.linspace(scale * beta_start, scale * beta_end, num_train_timesteps, dtype=torch.float32)
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
@@ -146,6 +148,8 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.sqrt_alphas_cumprod = self.alphas_cumprod ** 0.5
+        self.sqrt_one_minus_alphas_cumprod = (1 - self.alphas_cumprod) ** 0.5
         self.one = torch.tensor(1.0)
 
         # standard deviation of the initial noise distribution
@@ -304,22 +308,24 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
 
         return DDPMSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
 
-    def add_noise(
+    def add_noise(      # q_sample
         self,
         original_samples: torch.FloatTensor,
         noise: torch.FloatTensor,
         timesteps: torch.IntTensor,
     ) -> torch.FloatTensor:
         # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
+        alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
+        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
+        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
         timesteps = timesteps.to(original_samples.device)
 
-        sqrt_alpha_prod = self.alphas_cumprod[timesteps] ** 0.5
+        sqrt_alpha_prod = sqrt_alphas_cumprod[timesteps]
         sqrt_alpha_prod = sqrt_alpha_prod.flatten()
         while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
             sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
 
-        sqrt_one_minus_alpha_prod = (1 - self.alphas_cumprod[timesteps]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alphas_cumprod[timesteps]
         sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
         while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)

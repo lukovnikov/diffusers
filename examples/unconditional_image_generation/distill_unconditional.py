@@ -79,10 +79,9 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--output_dir",
+        "--load_dir",
         type=str,
-        default="ddpm-model-64",
-        help="The output directory where the model predictions and checkpoints will be written.",
+        help="The directory where the original model is stored.",
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument(
@@ -91,22 +90,14 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=None,           # by default, the resolution is determined by the used dataset
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution. The default value of 'None' lets the script choose the resolution based on the dataset"
-            " automatically."
-        ),
-    )
+
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
         "--eval_batch_size", type=int, default=16, help="The number of images to generate for evaluation."
     )
+
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -208,22 +199,6 @@ def parse_args():
         ),
     )
 
-    parser.add_argument(
-        "--predict_epsilon",
-        action="store_true",
-        default=True,
-        help="Whether the model should predict the 'epsilon'/noise error. This is enabled by default.",
-    )
-    parser.add_argument(
-        "--predict_x0",
-        dest="predict_epsilon",
-        action="store_false",
-        help="Whether the model should predict directly the reconstructed image 'x0'. This flag is disabled by default."
-    )
-
-    parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
-
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -231,12 +206,6 @@ def parse_args():
 
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
-
-    if args.resolution is None:  # resolution default
-        if args.dataset_name == "cifar10":
-            args.resolution = 32
-        else:
-            args.resolution = 64
 
     return args
 
@@ -432,7 +401,7 @@ def main(args):
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
-                # Predict the noise residual
+                # Predict the noise residual or original image
                 model_output = model(noisy_images, timesteps).sample
 
                 if args.predict_epsilon:

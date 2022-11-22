@@ -22,6 +22,9 @@ def main(args):
 
     generator = torch.manual_seed(42)
 
+
+    if args.output_subdir is None:
+        args.output_subdir = f"samples_{args.sampler}" + (f"_{args.num_steps}" if args.num_steps is not None else "")
     os.makedirs(os.path.join(args.load_dir, args.output_subdir), exist_ok=True)
     with open(os.path.join(args.load_dir, args.output_subdir, "config.json"), "w") as f:
         json.dump(args.__dict__, f, indent=4)
@@ -69,10 +72,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--load_dir", type=str, default="ddpm-model-64")
     parser.add_argument("--sampler", type=str, default="ddpm")  # can be ddpm or ddim
-    parser.add_argument("--num_steps", type=int, default=-1)
+    parser.add_argument("--num_steps", type=int, default=None)
     parser.add_argument("--ddim_eta", type=float, default=0.0)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--output_subdir", type=str, default="samples")
+    parser.add_argument("--output_subdir", type=str, default=None)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--gpu", type=int, default=-1)
 

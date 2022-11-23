@@ -17,7 +17,9 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from ...pipeline_utils import DiffusionPipeline, ImagePipelineOutput
+from diffusers.models.unet_2d import UNet2DModel
+from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler, DDIMScheduler
+from diffusers.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
 class DDIMPipeline(DiffusionPipeline):
@@ -124,3 +126,26 @@ class DDIMPipeline(DiffusionPipeline):
             return (image,)
 
         return ImagePipelineOutput(images=image)
+
+
+if __name__ == '__main__':
+    model_id = "google/ddpm-cifar10-32"
+
+    unet = UNet2DModel.from_pretrained(model_id)
+    ddim_scheduler = DDIMScheduler()
+
+    ddim = DDIMPipeline(unet=unet, scheduler=ddim_scheduler)
+    ddim.scheduler.__class__ = DDIMExtendedScheduler
+    ddim.to(torch.device("cpu"))
+    ddim.set_progress_bar_config(disable=None)
+
+
+    generator = torch.manual_seed(42)
+    ddim_images = ddim(
+        batch_size=4,
+        generator=generator,
+        num_inference_steps=1000,
+        eta=0.0,
+        output_type="numpy",
+        use_clipped_model_output=True,  # Need this to make DDIM match DDPM
+    ).images

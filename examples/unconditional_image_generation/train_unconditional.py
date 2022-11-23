@@ -238,6 +238,9 @@ def parse_args():
         else:
             args.resolution = 64
 
+    if args.ddpm_beta_scheduler == "cosine":
+        args.ddpm_beta_scheduler = "squaredcos_cap_v2"
+
     return args
 
 
@@ -322,6 +325,8 @@ def main(args):
     print(f"Number of parameters: {count_parameters(model)//1e6:.2f}M")
 
     accepts_predict_epsilon = "predict_epsilon" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+
+    print(f"Used beta schedule: {args.ddpm_beta_schedule}")
 
     if accepts_predict_epsilon:
         noise_scheduler = DDPMScheduler(

@@ -238,8 +238,8 @@ def parse_args():
         else:
             args.resolution = 64
 
-    if args.ddpm_beta_scheduler == "cosine":
-        args.ddpm_beta_scheduler = "squaredcos_cap_v2"
+    if args.ddpm_beta_schedule == "cosine":
+        args.ddpm_beta_schedule = "squaredcos_cap_v2"
 
     return args
 

@@ -129,6 +129,7 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         clip_sample: bool = True,
         set_alpha_to_one: bool = True,
         steps_offset: int = 0,
+        predict_epsilon: bool = True,
     ):
         if trained_betas is not None:
             self.betas = (
@@ -191,7 +192,6 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         self,
         num_inference_steps: int,
         device: Union[str, torch.device] = None,
-        substeps_mode: str = "linear",
     ):
         """
         Sets the discrete timesteps used for the diffusion chain. Supporting function to be run before inference.
@@ -204,18 +204,15 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
                 When quadratic, the step size grows with decreasing t, such that for noisier x_t, the steps are larger.
 
         """
-        if substeps_mode.startswith("l"):
-            # using linearly spaced steps
-            self.num_inference_steps = num_inference_steps
-            step_ratio = self.config.num_train_timesteps / self.num_inference_steps
-            # creates integer timesteps by multiplying by ratio
-            # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-            timesteps += self.config.steps_offset
+        # using linearly spaced steps
+        self.num_inference_steps = num_inference_steps
+        step_ratio = self.config.num_train_timesteps / self.num_inference_steps
+        # creates integer timesteps by multiplying by ratio
+        # casting to int to avoid issues when num_inference_step is power of 3
+        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        timesteps += self.config.steps_offset
 
-            self.timesteps = torch.from_numpy(timesteps).to(device)
-        else:
-            raise NotImplementedError("Substep modes other than 'linear' not implemented yet. ")
+        self.timesteps = torch.from_numpy(timesteps).to(device)
 
     def step(
         self,
@@ -227,7 +224,6 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         generator=None,
         variance_noise: Optional[torch.FloatTensor] = None,
         return_dict: bool = True,
-        predict_epsilon: bool = True,
     ) -> Union[DDIMSchedulerOutput, Tuple]:
         """
         Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
@@ -288,7 +284,7 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
 
         # 3. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        if predict_epsilon:
+        if self.config.predict_epsilon:
             pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
         else:
             pred_original_sample = model_output
@@ -390,7 +386,6 @@ class DDIMExtendedScheduler(DDIMScheduler):
         self,
         num_inference_steps: int,
         device: Union[str, torch.device] = None,
-        substeps_mode: str = "linear",
     ):
         """
         Sets the discrete timesteps used for the diffusion chain. Supporting function to be run before inference.
@@ -403,18 +398,15 @@ class DDIMExtendedScheduler(DDIMScheduler):
                 When quadratic, the step size grows with decreasing t, such that for noisier x_t, the steps are larger.
 
         """
-        if substeps_mode.startswith("l"):
-            # using linearly spaced steps
-            self.num_inference_steps = num_inference_steps
-            step_ratio = self.config.num_train_timesteps / self.num_inference_steps
-            # creates integer timesteps by multiplying by ratio
-            # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-            timesteps += self.config.steps_offset
+        # using linearly spaced steps
+        self.num_inference_steps = num_inference_steps
+        step_ratio = self.config.num_train_timesteps / self.num_inference_steps
+        # creates integer timesteps by multiplying by ratio
+        # casting to int to avoid issues when num_inference_step is power of 3
+        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        timesteps += self.config.steps_offset
 
-            self.timesteps = torch.from_numpy(timesteps).to(device)
-        else:
-            raise NotImplementedError("Substep modes other than 'linear' not implemented yet. ")
+        self.timesteps = torch.from_numpy(timesteps).to(device)
 
     def step(
         self,
@@ -426,7 +418,6 @@ class DDIMExtendedScheduler(DDIMScheduler):
         generator=None,
         variance_noise: Optional[torch.FloatTensor] = None,
         return_dict: bool = True,
-        predict_epsilon: bool = True,
     ) -> Union[DDIMSchedulerOutput, Tuple]:
         """
         Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
@@ -494,7 +485,7 @@ class DDIMExtendedScheduler(DDIMScheduler):
 
         # 3. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        if predict_epsilon:
+        if self.config.predict_epsilon:
             pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
         else:
             pred_original_sample = model_output
@@ -545,3 +536,23 @@ class DDIMExtendedScheduler(DDIMScheduler):
             return (prev_sample,)
 
         return DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
+
+
+class DistilledDDIMScheduler(DDIMExtendedScheduler):
+    def set_timesteps(
+        self,
+        num_inference_steps: int,
+        device: Union[str, torch.device] = None,
+        prevtimesteps: torch.LongTensor = None,       # previous selection of timesteps
+    ):
+        if prevtimesteps is None:
+            super(DistilledDDIMScheduler, self).set_timesteps(num_inference_steps, device=device)
+        else:
+            self.num_inference_steps = num_inference_steps
+            step_ratio = len(prevtimesteps) / self.num_inference_steps
+            selection = (np.arange(0, num_inference_steps) * step_ratio).round().copy().astype(np.int64)
+            # selection = len(prevtimesteps) - 1 - (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+            selection = torch.from_numpy(selection).to(prevtimesteps.device)
+            # select from prevtimesteps using timesteps
+            newtimesteps = prevtimesteps[selection]
+            self.timesteps = newtimesteps

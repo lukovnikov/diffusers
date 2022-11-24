@@ -2,6 +2,7 @@ import argparse
 import inspect
 import math
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 import shutil
@@ -15,7 +16,7 @@ from accelerate.logging import get_logger
 from datasets import load_dataset
 from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, DiffusionPipeline
 from diffusers.optimization import get_scheduler
-from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler, DistilledDDIMScheduler
 from diffusers.training_utils import EMAModel
 from huggingface_hub import HfFolder, Repository, whoami
 from torchvision.transforms import (
@@ -29,6 +30,7 @@ from torchvision.transforms import (
 )
 from tqdm.auto import tqdm
 
+from examples.unconditional_image_generation.sample_unconditional import _ddim_scheduler_from_ddpm_scheduler
 
 logger = get_logger(__name__)
 
@@ -90,6 +92,13 @@ def parse_args():
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
+    )
+
+    parser.add_argument(
+        "--distill_schedule",
+        type=str,
+        default="512 256 128 64 32 16 8 4 2 1",
+        help="Number of steps to use in every distillation phase"
     )
 
     parser.add_argument(
@@ -233,16 +242,6 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
-def _ddim_scheduler_from_ddpm_scheduler(sched):
-    ret = DDIMExtendedScheduler(
-        num_train_timesteps=sched.num_train_timesteps,
-        trained_betas=sched.betas,
-        clip_sample=sched.clip_sample,
-    )
-    assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
-    return ret
-
-
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
@@ -254,23 +253,25 @@ def main(args):
 
     pipeline = DiffusionPipeline.from_pretrained(args.teacher_dir)
     teachermodel = pipeline.unet
-    ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler)
+    ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler, _class=DistilledDDIMScheduler)
 
     print(f"Number of parameters: {count_parameters(teachermodel)//1e6:.2f}M")
 
-    accepts_predict_epsilon = "predict_epsilon" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+    # accepts_predict_epsilon = "predict_epsilon" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+    #
+    # if accepts_predict_epsilon:
+    #     noise_scheduler = DDPMScheduler(
+    #         num_train_timesteps=args.ddpm_num_steps,
+    #         beta_schedule=args.ddpm_beta_schedule,
+    #         predict_epsilon=args.predict_epsilon,
+    #     )
+    # else:
+    #     noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
 
-    if accepts_predict_epsilon:
-        noise_scheduler = DDPMScheduler(
-            num_train_timesteps=args.ddpm_num_steps,
-            beta_schedule=args.ddpm_beta_schedule,
-            predict_epsilon=args.predict_epsilon,
-        )
-    else:
-        noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
+    studentmodel = deepcopy(teachermodel)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        studentmodel.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,

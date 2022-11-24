@@ -18,7 +18,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from diffusers.models.unet_2d import UNet2DModel
-from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler, DDIMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler, DDIMScheduler, DistilledDDIMScheduler
 from diffusers.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
@@ -49,7 +49,6 @@ class DDIMPipeline(DiffusionPipeline):
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         predict_epsilon: bool = True,
-        substeps_mode="linear",  # linear or quad(ratic)
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
@@ -74,10 +73,6 @@ class DDIMPipeline(DiffusionPipeline):
                 Whether or not to return a [`~pipeline_utils.ImagePipelineOutput`] instead of a plain tuple.
             predict_epsilon (`bool`, *optional*, defaults to True):
                 Whether the Unet model should be used to predict eps (as opposed to x0).
-            substeps_mode (`str`, *optional*, defaults to "linear"):
-                How the steps are selected in the DDIM sampler. When "linear", the selected steps are linearly spaced.
-                When quadratic, the step size grows with decreasing t, such that for noisier x_t, the steps are larger.
-
         Returns:
             [`~pipeline_utils.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if
             `return_dict` is True, otherwise a `tuple. When returning a tuple, the first element is a list with the
@@ -92,7 +87,7 @@ class DDIMPipeline(DiffusionPipeline):
         image = image.to(self.device)
 
         # set step values
-        self.scheduler.set_timesteps(num_inference_steps, substeps_mode=substeps_mode)
+        self.scheduler.set_timesteps(num_inference_steps)
 
         # Ignore use_clipped_model_output if the scheduler doesn't accept this argument
         accepts_use_clipped_model_output = "use_clipped_model_output" in set(
@@ -128,7 +123,11 @@ class DDIMPipeline(DiffusionPipeline):
         return ImagePipelineOutput(images=image)
 
 
-if __name__ == '__main__':
+class DistilledDDIMPipeline(DDIMPipeline):
+    pass
+
+
+def tst_ddim():
     model_id = "google/ddpm-cifar10-32"
 
     unet = UNet2DModel.from_pretrained(model_id)
@@ -149,3 +148,50 @@ if __name__ == '__main__':
         output_type="numpy",
         use_clipped_model_output=True,  # Need this to make DDIM match DDPM
     ).images
+
+
+def tst_distilled_ddim():
+    model_id = "google/ddpm-cifar10-32"
+
+    unet = UNet2DModel.from_pretrained(model_id)
+    sched = DistilledDDIMScheduler()
+
+    ddim = DDIMPipeline(unet=unet, scheduler=sched)
+    ddim.to(torch.device("cpu"))
+    ddim.set_progress_bar_config(disable=None)
+
+    # Sample gaussian noise to begin loop
+    image = torch.randn(
+        (1, unet.in_channels, unet.sample_size, unet.sample_size)
+    )
+
+    # set step values
+    sched.set_timesteps(512)
+    sched.set_timesteps(256, prevtimesteps=sched.timesteps)
+    sched.set_timesteps(128, prevtimesteps=sched.timesteps)
+    sched.set_timesteps(64, prevtimesteps=sched.timesteps)
+    sched.set_timesteps(32, prevtimesteps=sched.timesteps)
+    sched.set_timesteps(16, prevtimesteps=sched.timesteps)
+    sched.set_timesteps(8, prevtimesteps=sched.timesteps)
+    sched.set_timesteps(4, prevtimesteps=sched.timesteps)
+
+    timesteps = sched.timesteps
+    timesteps = torch.cat([timesteps, -1 * torch.ones_like(timesteps)[:1]], 0)
+    timepairs = list(zip(timesteps[:-1], timesteps[1:]))
+    for t in timepairs:
+        start_t, end_t = t
+        # 1. predict noise model_output
+        model_output = unet(image, start_t).sample
+
+        # 2. predict previous mean of image x_t-1 and add variance depending on eta
+        # eta corresponds to η in paper and should be between [0, 1]
+        # do x_t -> x_t-1
+        image = sched.step(model_output, t, image, 0.).prev_sample
+
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+
+
+if __name__ == '__main__':
+    tst_distilled_ddim()
+

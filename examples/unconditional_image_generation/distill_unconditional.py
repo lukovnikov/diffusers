@@ -13,8 +13,9 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from datasets import load_dataset
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, DiffusionPipeline
 from diffusers.optimization import get_scheduler
+from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler
 from diffusers.training_utils import EMAModel
 from huggingface_hub import HfFolder, Repository, whoami
 from torchvision.transforms import (
@@ -232,6 +233,16 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
+def _ddim_scheduler_from_ddpm_scheduler(sched):
+    ret = DDIMExtendedScheduler(
+        num_train_timesteps=sched.num_train_timesteps,
+        trained_betas=sched.betas,
+        clip_sample=sched.clip_sample,
+    )
+    assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
+    return ret
+
+
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
@@ -241,54 +252,11 @@ def main(args):
         logging_dir=logging_dir,
     )
 
-    if args.resolution == 32:
-        model = UNet2DModel(
-            sample_size=args.resolution,
-            in_channels=3,
-            out_channels=3,
-            layers_per_block=2,
-            dropout=args.dropout,
-            block_out_channels=(128, 256, 256, 256),
-            down_block_types=(
-                "DownBlock2D",
-                "AttnDownBlock2D",
-                "DownBlock2D",
-                "DownBlock2D",
-            ),
-            up_block_types=(
-                "UpBlock2D",
-                "UpBlock2D",
-                "AttnUpBlock2D",
-                "UpBlock2D",
-            ),
-            use_scale_shift_norm=True,
-        )
-    else:
-        model = UNet2DModel(
-            sample_size=args.resolution,
-            in_channels=3,
-            out_channels=3,
-            layers_per_block=2,
-            dropout=args.dropout,
-            block_out_channels=(128, 128, 256, 256, 256),
-            down_block_types=(
-                "DownBlock2D",
-                "DownBlock2D",
-                "AttnDownBlock2D",
-                "DownBlock2D",
-                "DownBlock2D",
-            ),
-            up_block_types=(
-                "UpBlock2D",
-                "UpBlock2D",
-                "AttnUpBlock2D",
-                "UpBlock2D",
-                "UpBlock2D",
-            ),
-            use_scale_shift_norm=True,
-        )
+    pipeline = DiffusionPipeline.from_pretrained(args.teacher_dir)
+    teachermodel = pipeline.unet
+    ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler)
 
-    print(f"Number of parameters: {count_parameters(model)//1e6:.2f}M")
+    print(f"Number of parameters: {count_parameters(teachermodel)//1e6:.2f}M")
 
     accepts_predict_epsilon = "predict_epsilon" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
 

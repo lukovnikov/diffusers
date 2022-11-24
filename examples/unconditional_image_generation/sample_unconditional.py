@@ -4,51 +4,70 @@ import os
 
 import torch
 
-from diffusers import DDIMPipeline, DDIMScheduler, DDPMPipeline
+from diffusers import DDIMPipeline, DDIMScheduler, DDPMPipeline, DiffusionPipeline
+from diffusers import LDMPipeline
 from PIL import Image
 
 
+def _ddim_scheduler_from_ddpm_scheduler(sched):
+    ret = DDIMScheduler(
+        num_train_timesteps=sched.num_train_timesteps,
+        trained_betas=sched.betas,
+        clip_sample=sched.clip_sample,
+    )
+    assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
+    return ret
+
+
 def main(args):
-    pipeline = DDPMPipeline.from_pretrained(args.load_dir).to(
+    pipeline = DiffusionPipeline.from_pretrained(args.loadmodel).to(
         torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 else "cpu")
     )
 
     if args.sampler == "ddim":
-        ddimsched = DDIMScheduler.from_ddpm_scheduler(pipeline.scheduler)
+        ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler)
         pipeline = DDIMPipeline(pipeline.unet, ddimsched)
 
-    num_steps = args.num_steps if args.num_steps != -1 else pipeline.scheduler.num_train_timesteps
+    num_steps = args.numsteps if args.numsteps != -1 else pipeline.scheduler.num_train_timesteps
     print(f"Number of timesteps used for sampling: {num_steps}")
 
     generator = torch.manual_seed(42)
 
 
-    if args.output_subdir is None:
-        args.output_subdir = f"samples_{args.sampler}" + (f"_{args.num_steps}" if args.num_steps is not None else "")
-    os.makedirs(os.path.join(args.load_dir, args.output_subdir), exist_ok=True)
-    with open(os.path.join(args.load_dir, args.output_subdir, "config.json"), "w") as f:
+    if args.outputsubdir is None:
+        args.outputsubdir = f"samples_{args.sampler}" + (f"_{args.numsteps}" if args.numsteps is not None else "")
+    os.makedirs(os.path.join(args.savedir, args.outputsubdir), exist_ok=True)
+    with open(os.path.join(args.savedir, args.outputsubdir, "config.json"), "w") as f:
         json.dump(args.__dict__, f, indent=4)
-    os.makedirs(os.path.join(args.load_dir, args.output_subdir, "imgs"), exist_ok=True)
+    os.makedirs(os.path.join(args.savedir, args.outputsubdir, "imgs"), exist_ok=True)
 
     cnt = 0  # how many images generated so far
-    numdigits = len(str(int(args.num_samples)))
+    numdigits = len(str(int(args.numsamples)))
 
-    while cnt < args.num_samples:
+    while cnt < args.numsamples:
         # run pipeline in inference (sample random noise and denoise)
-        if args.sampler == "ddpm":
+        if isinstance(pipeline, DDPMPipeline):
             images = pipeline(
                 generator=generator,
-                batch_size=args.batch_size,
+                batch_size=args.batchsize,
                 output_type="numpy",
             ).images
-        elif args.sampler == "ddim":
+        elif isinstance(pipeline, DDIMPipeline):
             images = pipeline(
                 generator=generator,
-                batch_size=args.batch_size,
+                batch_size=args.batchsize,
                 output_type="numpy",
-                num_inference_steps=args.num_steps,
+                num_inference_steps=args.numsteps,
                 use_clipped_model_output=True,
-                eta=args.ddim_eta,
+                eta=args.ddimeta,
+            ).images
+        elif isinstance(pipeline, LDMPipeline):
+            images = pipeline(
+                generator=generator,
+                batch_size=args.batchsize,
+                output_type="numpy",
+                num_inference_steps=args.numsteps,
+                eta=args.ddimeta,
             ).images
 
         # denormalize the images and save to tensorboard
@@ -57,27 +76,30 @@ def main(args):
         for img in list(images_processed):
             pilimage = Image.fromarray(img, mode="RGB")
             pilimage.save(
-                os.path.join(args.load_dir, args.output_subdir, "imgs", f"{{:0{numdigits}d}}.png".format(cnt))
+                os.path.join(args.savedir, args.outputsubdir, "imgs", f"{{:0{numdigits}d}}.png".format(cnt))
             )
             cnt += 1
 
         print(f"generated {cnt} images")
 
-    print(f"generated {cnt} images and saved in {os.path.join(args.load_dir, args.output_subdir, 'imgs')}")
+    print(f"generated {cnt} images and saved in {os.path.join(args.savedir, args.outputsubdir, 'imgs')}")
 
     print(pipeline)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument("--load_dir", type=str, default="ddpm-model-64")
+    parser.add_argument("--loadmodel", type=str, default="ddpm-model-64")
+    parser.add_argument("--savedir", type=str, default=None)
     parser.add_argument("--sampler", type=str, default="ddpm")  # can be ddpm or ddim
-    parser.add_argument("--num_steps", type=int, default=None)
-    parser.add_argument("--ddim_eta", type=float, default=0.0)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--output_subdir", type=str, default=None)
-    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--numsteps", type=int, default=None)
+    parser.add_argument("--ddimeta", type=float, default=0.0)
+    parser.add_argument("--batchsize", type=int, default=16)
+    parser.add_argument("--outputsubdir", type=str, default=None)
+    parser.add_argument("--numsamples", type=int, default=10)
     parser.add_argument("--gpu", type=int, default=-1)
 
     args = parser.parse_args()
+    if args.savedir is None:
+        args.savedir = args.loadmodel
     main(args)

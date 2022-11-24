@@ -163,16 +163,6 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
 
-    @classmethod
-    def from_ddpm_scheduler(cls, sched):
-        ret = cls(
-            num_train_timesteps=sched.num_train_timesteps,
-            trained_betas=sched.betas,
-            clip_sample=sched.clip_sample,
-        )
-        assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
-        return ret
-
     def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
         """
         Ensures interchangeability with schedulers that need to scale the denoising model input depending on the
@@ -395,6 +385,37 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
 
 
 class DDIMExtendedScheduler(DDIMScheduler):
+
+    def set_timesteps(
+        self,
+        num_inference_steps: int,
+        device: Union[str, torch.device] = None,
+        substeps_mode: str = "linear",
+    ):
+        """
+        Sets the discrete timesteps used for the diffusion chain. Supporting function to be run before inference.
+
+        Args:
+            num_inference_steps (`int`):
+                the number of diffusion steps used when generating samples with a pre-trained model.
+            substeps_mode (`str`, *optional*, defaults to "linear"):
+                How the steps are selected in the DDIM sampler. When "linear", the selected steps are linearly spaced.
+                When quadratic, the step size grows with decreasing t, such that for noisier x_t, the steps are larger.
+
+        """
+        if substeps_mode.startswith("l"):
+            # using linearly spaced steps
+            self.num_inference_steps = num_inference_steps
+            step_ratio = self.config.num_train_timesteps / self.num_inference_steps
+            # creates integer timesteps by multiplying by ratio
+            # casting to int to avoid issues when num_inference_step is power of 3
+            timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+            timesteps += self.config.steps_offset
+
+            self.timesteps = torch.from_numpy(timesteps).to(device)
+        else:
+            raise NotImplementedError("Substep modes other than 'linear' not implemented yet. ")
+
     def step(
         self,
         model_output: torch.FloatTensor,
@@ -469,6 +490,7 @@ class DDIMExtendedScheduler(DDIMScheduler):
         # )
 
         beta_prod_t = 1 - alpha_prod_t
+        beta_prod_tm1 = 1 - alpha_prod_tm1
 
         # 3. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
@@ -483,7 +505,7 @@ class DDIMExtendedScheduler(DDIMScheduler):
 
         # 5. compute variance: "sigma_t(η)" -> see formula (16)
         # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-        variance = self._get_variance(timestep, prev_timestep)
+        variance = (beta_prod_tm1 / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_tm1)
         std_dev_t = eta * variance ** (0.5)
 
         if use_clipped_model_output:
@@ -491,10 +513,10 @@ class DDIMExtendedScheduler(DDIMScheduler):
             model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
 
         # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * model_output
+        pred_sample_direction = (1 - alpha_prod_tm1 - std_dev_t**2) ** (0.5) * model_output
 
         # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+        prev_sample = alpha_prod_tm1 ** (0.5) * pred_original_sample + pred_sample_direction
 
         if eta > 0:
             # randn_like does not support generator https://github.com/pytorch/pytorch/issues/27072
@@ -514,7 +536,8 @@ class DDIMExtendedScheduler(DDIMScheduler):
                     variance_noise = torch.randn(
                         model_output.shape, generator=generator, device=device, dtype=model_output.dtype
                     )
-            variance = self._get_variance(timestep, prev_timestep) ** (0.5) * eta * variance_noise
+            variance = (beta_prod_tm1 / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_tm1)
+            variance = variance ** (0.5) * eta * variance_noise
 
             prev_sample = prev_sample + variance
 

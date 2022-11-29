@@ -11,7 +11,6 @@ from PIL import Image
 from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler
 
 
-
 def _ddim_scheduler_from_ddpm_scheduler(sched, _class=DDIMExtendedScheduler):
     ret = _class(
         num_train_timesteps=sched.num_train_timesteps,

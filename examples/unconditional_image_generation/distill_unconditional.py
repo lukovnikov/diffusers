@@ -86,6 +86,12 @@ def parse_args():
         type=str,
         help="The directory where the teacher model is stored.",
     )
+    parser.add_argument(
+        "--output_subdir",
+        type=str,
+        default="distilled",
+        help="The directory where the student models and logs are stored.",
+    )
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument(
         "--cache_dir",
@@ -209,6 +215,17 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=None,           # by default, the resolution is determined by the used dataset
+        help=(
+            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+            " resolution. The default value of 'None' lets the script choose the resolution based on the dataset"
+            " automatically."
+        ),
+    )
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -216,6 +233,12 @@ def parse_args():
 
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
+
+    if args.resolution is None:  # resolution default
+        if args.dataset_name == "cifar10":
+            args.resolution = 32
+        else:
+            args.resolution = 64
 
     return args
 
@@ -243,7 +266,8 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 
 def main(args):
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    outputdir = os.path.join(args.load_dir, args.output_subdir)
+    logging_dir = os.path.join(outputdir, args.logging_dir)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -251,9 +275,11 @@ def main(args):
         logging_dir=logging_dir,
     )
 
-    pipeline = DiffusionPipeline.from_pretrained(args.teacher_dir)
+    pipeline = DiffusionPipeline.from_pretrained(args.load_dir)
     teachermodel = pipeline.unet
+    originalscheduler = pipeline.scheduler
     ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler, _class=DistilledDDIMScheduler)
+    pipeline.scheduler = ddimsched
 
     print(f"Number of parameters: {count_parameters(teachermodel)//1e6:.2f}M")
 
@@ -321,30 +347,30 @@ def main(args):
         num_training_steps=(len(train_dataloader) * args.num_epochs) // args.gradient_accumulation_steps,
     )
 
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    studentmodel, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        studentmodel, optimizer, train_dataloader, lr_scheduler
     )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
 
-    ema_model = EMAModel(model, inv_gamma=args.ema_inv_gamma, power=args.ema_power, max_value=args.ema_max_decay)
+    ema_model = EMAModel(studentmodel, inv_gamma=args.ema_inv_gamma, power=args.ema_power, max_value=args.ema_max_decay)
 
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
             if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
+                repo_name = get_full_repo_name(Path(outputdir).name, token=args.hub_token)
             else:
                 repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
+            repo = Repository(outputdir, clone_from=repo_name)
 
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
+            with open(os.path.join(outputdir, ".gitignore"), "w+") as gitignore:
                 if "step_*" not in gitignore:
                     gitignore.write("step_*\n")
                 if "epoch_*" not in gitignore:
                     gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+        elif outputdir is not None:
+            os.makedirs(outputdir, exist_ok=True)
 
     if accelerator.is_main_process:
         run = os.path.split(__file__)[-1].split(".")[0]
@@ -352,7 +378,8 @@ def main(args):
 
     global_step = 0
     for epoch in range(args.num_epochs):
-        model.train()
+        studentmodel.train()
+        teachermodel.eval()
         progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(train_dataloader):
@@ -362,12 +389,14 @@ def main(args):
             bsz = clean_images.shape[0]
             # Sample a random timestep for each image
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                0, originalscheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
             ).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            noisy_images = originalscheduler.add_noise(clean_images, noise, timesteps)
+
+            # run original pipeline for few steps on noisy images
 
             with accelerator.accumulate(model):
                 # Predict the noise residual or original image

@@ -464,16 +464,18 @@ class DDIMExtendedScheduler(DDIMScheduler):
         # 1. get previous step value (=t-1)
         batsize = sample.shape[0]
         timesteps, prev_timesteps = timestep        # timesteps can be 0D tensor, or 1D tensor; if 0D, then expand to 1D
+        timesteps, prev_timesteps = timesteps.to(sample.device), prev_timesteps.to(sample.device)
         if timesteps.dim() == 0:
             timesteps = timesteps[None].repeat(batsize)
         if prev_timesteps.dim() == 0:
             prev_timesteps = prev_timesteps[None].repeat(batsize)
 
         # 2. compute alphas, betas
-        alpha_prod_t = _extract_into_tensor(self.alphas_cumprod, timesteps, (batsize, 1, 1, 1))
-        alpha_prod_tm1 = _extract_into_tensor(self.alphas_cumprod, prev_timesteps, (batsize, 1, 1, 1))
+        alphas_cumprod = self.alphas_cumprod.to(sample.device)
+        alpha_prod_t = _extract_into_tensor(alphas_cumprod, timesteps, (batsize, 1, 1, 1))
+        alpha_prod_tm1 = _extract_into_tensor(alphas_cumprod, prev_timesteps, (batsize, 1, 1, 1))
         alpha_prod_tm1 = torch.where(
-            prev_timesteps[:, None, None, None] >= 0, alpha_prod_tm1, self.final_alpha_cumprod)
+            prev_timesteps[:, None, None, None] >= 0, alpha_prod_tm1, self.final_alpha_cumprod.to(sample.device))
         # alpha_prod_t = self.alphas_cumprod[timestep]
         # alpha_prod_t_prev = (
         #     self.alphas_cumprod[prev_timesteps] if bool(prev_timesteps >= 0) else self.final_alpha_cumprod

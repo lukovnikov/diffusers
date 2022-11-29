@@ -18,8 +18,8 @@ from typing import Optional, Tuple, Union
 import torch
 
 from diffusers.models.unet_2d import UNet2DModel
-from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler, DDIMScheduler, DistilledDDIMScheduler
 from diffusers.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
+from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler, DDIMScheduler, DistilledDDIMScheduler
 
 
 class DDIMPipeline(DiffusionPipeline):

@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument(
         "--load_dir",
         type=str,
-        help="The directory where the original model is stored.",
+        help="The directory where the teacher model is stored.",
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument(

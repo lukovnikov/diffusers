@@ -376,6 +376,12 @@ def main(args):
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run)
 
+    # parse distillation schedule
+    distillsched = [int(x) for x in args.distill_schedule.split(" ")]
+    distillsched = list(zip(distillsched[:-1], distillsched[1:]))
+    distillphase = 0
+    prevtimesteps = None
+
     global_step = 0
     for epoch in range(args.num_epochs):
         studentmodel.train()
@@ -387,16 +393,39 @@ def main(args):
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape).to(clean_images.device)
             bsz = clean_images.shape[0]
+
+            prevnumsteps, numsteps = distillsched[distillphase]
+            assert prevnumsteps / numsteps == prevnumsteps // numsteps, "Supporting only whole jump sizes"
+            jumpsize = prevnumsteps / numsteps
+
+            # run original pipeline for few steps on noisy images
+            originalscheduler.set_timesteps(prevnumsteps, prevtimesteps=prevtimesteps)
+
             # Sample a random timestep for each image
             timesteps = torch.randint(
-                0, originalscheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                0, originalscheduler.config.num_train_timesteps - int(jumpsize), (bsz,), device=clean_images.device
             ).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
             noisy_images = originalscheduler.add_noise(clean_images, noise, timesteps)
 
-            # run original pipeline for few steps on noisy images
+
+            image = noise
+
+            timesteps = originalscheduler.timesteps
+            timesteps = torch.cat([timesteps, -1 * torch.ones_like(timesteps)[:1]], 0)
+            timepairs = list(zip(timesteps[:-1], timesteps[1:]))
+            for t in timepairs:
+                start_t, end_t = t
+                # 1. predict noise model_output
+                model_output = teachermodel(image, start_t).sample
+
+                # 2. predict previous mean of image x_t-1 and add variance depending on eta
+                # eta corresponds to η in paper and should be between [0, 1]
+                # do x_t -> x_t-1
+                image = originalscheduler.step(model_output, t, image, 0.).prev_sample
+
 
             with accelerator.accumulate(model):
                 # Predict the noise residual or original image

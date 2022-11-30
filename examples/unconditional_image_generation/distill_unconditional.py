@@ -347,8 +347,8 @@ def main(args):
         num_training_steps=(len(train_dataloader) * args.num_epochs) // args.gradient_accumulation_steps,
     )
 
-    studentmodel, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        studentmodel, optimizer, train_dataloader, lr_scheduler
+    studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler
     )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -389,69 +389,92 @@ def main(args):
         progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(train_dataloader):
-            clean_images = batch["input"]
+            x0 = batch["input"]
             # Sample noise that we'll add to the images
-            noise = torch.randn(clean_images.shape).to(clean_images.device)
-            bsz = clean_images.shape[0]
+            noise = torch.randn(x0.shape).to(x0.device)
+            bsz = x0.shape[0]
 
             prevnumsteps, numsteps = distillsched[distillphase]
             assert prevnumsteps / numsteps == prevnumsteps // numsteps, "Supporting only whole jump sizes"
-            jumpsize = prevnumsteps / numsteps
+            jumpsize = int(prevnumsteps / numsteps)
 
             # run original pipeline for few steps on noisy images
-            originalscheduler.set_timesteps(prevnumsteps, prevtimesteps=prevtimesteps)
-
-            # Sample a random timestep for each image
-            timesteps = torch.randint(
-                0, originalscheduler.config.num_train_timesteps - int(jumpsize), (bsz,), device=clean_images.device
-            ).long()
+            ddimsched.set_timesteps(prevnumsteps, prevtimesteps=prevtimesteps)
+            oldtimesteps = ddimsched.timesteps.to(noise.device)
+            timestepselect = torch.randint(0, oldtimesteps.size(0) - jumpsize, (bsz,))
+            init_t = oldtimesteps[timestepselect]
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_images = originalscheduler.add_noise(clean_images, noise, timesteps)
+            alphas_cumprod = ddimsched.alphas_cumprod.to(x0.device)
+            alpha_bar_t = _extract_into_tensor(alphas_cumprod, init_t, x0.shape)
+            x_t = alpha_bar_t.sqrt() * x0 + (1 - alpha_bar_t).sqrt() * noise
+            # _x_t = originalscheduler.add_noise(x0, noise, init_t)
 
+            x_tmk = x_t
 
-            image = noise
+            with torch.no_grad():
+                # run original sampler for a few steps
+                for substep_i in range(jumpsize):
+                    start_t, end_t = oldtimesteps[timestepselect + substep_i], oldtimesteps[timestepselect + substep_i + 1]
+                    # 1. predict noise model_output
+                    model_output = teachermodel(x_tmk, start_t).sample
 
-            timesteps = originalscheduler.timesteps
-            timesteps = torch.cat([timesteps, -1 * torch.ones_like(timesteps)[:1]], 0)
-            timepairs = list(zip(timesteps[:-1], timesteps[1:]))
-            for t in timepairs:
-                start_t, end_t = t
-                # 1. predict noise model_output
-                model_output = teachermodel(image, start_t).sample
+                    # 2. predict previous mean of image x_t-1 and add variance depending on eta
+                    # eta corresponds to η in paper and should be between [0, 1]
+                    # do x_t -> x_t-1
+                    schedoutput = ddimsched.step(model_output, (start_t, end_t), x_tmk, 0.)
+                    x_tmk = schedoutput.prev_sample
 
-                # 2. predict previous mean of image x_t-1 and add variance depending on eta
-                # eta corresponds to η in paper and should be between [0, 1]
-                # do x_t -> x_t-1
-                image = originalscheduler.step(model_output, t, image, 0.).prev_sample
+            # compute target eps or x0:
+            #   last 'image' from previous steps gives the target x_tm1
+            if originalscheduler.config.predict_epsilon:
+                # sqrt_recip_alphas_cumprod_t = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, jump_start_t, x_t.shape)
+                # sqrt_recipm1_alphas_cumprod_t = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, jump_start_t, x_t.shape)
+                alpha_bar_t =  _extract_into_tensor(alphas_cumprod, init_t, x0.shape)
+                alpha_bar_tmX = _extract_into_tensor(alphas_cumprod, end_t, x0.shape)
+                # eps_star = (x_tmX - alpha_bar_tmX.sqrt() * sqrt_recip_alphas_cumprod_t * x_t) / \
+                #            ((1-alpha_bar_tmX).sqrt() -  alpha_bar_tmX.sqrt() * sqrt_recipm1_alphas_cumprod_t)
+                eps_star = (x_tmk - (alpha_bar_tmX / alpha_bar_t).sqrt() * x_t) / \
+                           ((1 - alpha_bar_tmX).sqrt() - (alpha_bar_tmX * (1 - alpha_bar_t) / alpha_bar_t).sqrt())
+                target = eps_star
+                # _x0_star = (x_t - (1-alpha_bar_t).sqrt()*eps_star)/alpha_bar_t.sqrt()
+                # _test = ((alpha_bar_tmX.sqrt() * _x0_star + (1 - alpha_bar_tmX).sqrt() * eps_star) - x_tmk).abs().max()
+            else:
+                alpha_bar_t =  _extract_into_tensor(alphas_cumprod, init_t, x0.shape)
+                alpha_bar_tmX = _extract_into_tensor(alphas_cumprod, end_t, x0.shape)
+                x0_star = (x_tmk - ((1 - alpha_bar_tmX) / (1 - alpha_bar_t)).sqrt() * x_t) /\
+                          (alpha_bar_tmX.sqrt() - (alpha_bar_t * (1 - alpha_bar_tmX) / (1 - alpha_bar_t)).sqrt())
+                target = x0_star
 
-
-            with accelerator.accumulate(model):
+            # TODO
+            # run student model
+            with accelerator.accumulate(studentmodel):
                 # Predict the noise residual or original image
-                model_output = model(noisy_images, timesteps).sample
+                model_output = studentmodel(x_t, init_t).sample
 
                 if args.predict_epsilon:
                     loss = F.mse_loss(model_output, noise)  # this could have different weights!
                 else:
                     alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+                        originalscheduler.alphas_cumprod, init_t, (x0.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
+                    # TODO: clipped SNR weighting
                     loss = snr_weights * F.mse_loss(
-                        model_output, clean_images, reduction="none"
+                        model_output, x0, reduction="none"
                     )  # use SNR weighting from distillation paper
                     loss = loss.mean()
 
                 accelerator.backward(loss)
 
                 assert accelerator.sync_gradients
-                gradnorm = compute_grad_norm(model)
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                gradnorm = compute_grad_norm(studentmodel)
+                accelerator.clip_grad_norm_(studentmodel.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 if args.use_ema:
-                    ema_model.step(model)
+                    ema_model.step(studentmodel)
                 optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes

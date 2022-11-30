@@ -44,6 +44,8 @@ class DDIMSchedulerOutput(BaseOutput):
 
     prev_sample: torch.FloatTensor
     pred_original_sample: Optional[torch.FloatTensor] = None
+    pred_eps: Optional[torch.FloatTensor] = None
+    model_output: Optional[torch.FloatTensor] = None
 
 
 def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999) -> torch.Tensor:
@@ -298,9 +300,9 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         variance = self._get_variance(timestep, prev_timestep)
         std_dev_t = eta * variance ** (0.5)
 
-        if use_clipped_model_output:
-            # the model_output is always re-derived from the clipped x_0 in Glide
-            model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+        # if use_clipped_model_output:
+        #    # the model_output is always re-derived from the clipped x_0 in Glide
+        model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
 
         # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
         pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * model_output
@@ -333,7 +335,10 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         if not return_dict:
             return (prev_sample,)
 
-        return DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
+        return DDIMSchedulerOutput(prev_sample=prev_sample,
+                                   pred_original_sample=pred_original_sample,
+                                   pred_eps=model_output,
+                                   model_output=model_output)
 
     def add_noise(
         self,

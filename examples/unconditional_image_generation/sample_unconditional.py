@@ -8,20 +8,7 @@ from diffusers import DDIMPipeline, DDIMScheduler, DDPMPipeline, DiffusionPipeli
 from diffusers import LDMPipeline
 from PIL import Image
 
-from diffusers.schedulers.scheduling_ddim import DDIMExtendedScheduler
-
-
-def _ddim_scheduler_from_ddpm_scheduler(sched, _class=DDIMExtendedScheduler):
-    ret = _class(
-        num_train_timesteps=sched.num_train_timesteps,
-        trained_betas=sched.betas,
-        clip_sample=sched.clip_sample,
-        # set_alpha_to_one=sched.config.set_alpha_to_one,
-        # steps_offset=sched.config.steps_offset,
-        predict_epsilon=sched.config.predict_epsilon,
-    )
-    assert torch.allclose(sched.alphas_cumprod, ret.alphas_cumprod)
-    return ret
+from diffusers.schedulers.scheduling_ddim import _ddim_scheduler_from_ddpm_scheduler
 
 
 def main(args):

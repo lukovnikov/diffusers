@@ -4,7 +4,8 @@ import math
 import os
 from copy import deepcopy
 from pathlib import Path
-from typing import Optional
+from torch.optim.lr_scheduler import LambdaLR
+from typing import Optional, Union, List
 import shutil
 import numpy as np
 
@@ -30,8 +31,8 @@ from torchvision.transforms import (
     ToTensor,
 )
 from tqdm.auto import tqdm
+from diffusers.schedulers.scheduling_ddim import _ddim_scheduler_from_ddpm_scheduler
 
-from examples.unconditional_image_generation.sample_unconditional import _ddim_scheduler_from_ddpm_scheduler
 
 logger = get_logger(__name__)
 
@@ -104,7 +105,7 @@ def parse_args():
     parser.add_argument(
         "--distill_schedule",
         type=str,
-        default="512 256 128 64 32 16 8 4 2 1",
+        default="1024 512 256 128 64 32 16 8 4 2 1",
         help="Number of steps to use in every distillation phase"
     )
 
@@ -129,15 +130,15 @@ def parse_args():
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
     )
-    parser.add_argument(
-        "--store_model_epochs",
-        type=int,
-        default=-1,
-        help=(
-            "How often to store the model during training. Different from --save_model_epoch, all these saved models"
-            " are retained after training."
-        ),
-    )
+    # parser.add_argument(
+    #     "--store_model_epochs",
+    #     type=int,
+    #     default=-1,
+    #     help=(
+    #         "How often to store the model during training. Different from --save_model_epoch, all these saved models"
+    #         " are retained after training."
+    #     ),
+    # )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -156,18 +157,30 @@ def parse_args():
         default=0.0,
         help="Dropout to be used during training (default=0).",
     )
+    # parser.add_argument(
+    #     "--lr_scheduler",
+    #     type=str,
+    #     default="constant",
+    #     help=(
+    #         'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+    #         ' "constant", "constant_with_warmup"]'
+    #     ),
+    # )
     parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="constant",
-        help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),
+        "--use_lr_schedule",
+        action="store_true",
+        default=True,
+        help="Whether to use linear decay lr schedule in every distillation phase.",
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--no_lr_schedule",
+        dest="use_lr_schedule",
+        action="store_false",
+        help="Whether to not use linear decay lr schedule in every distillation phase."
     )
+    # parser.add_argument(
+    #     "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+    # )
     parser.add_argument("--adam_beta1", type=float, default=0.95, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument(
@@ -183,17 +196,17 @@ def parse_args():
     parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
     parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
     parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
-    )
+    # parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+    # parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    # parser.add_argument(
+    #     "--hub_model_id",
+    #     type=str,
+    #     default=None,
+    #     help="The name of the repository to keep in sync with the local `output_dir`.",
+    # )
+    # parser.add_argument(
+    #     "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
+    # )
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -266,10 +279,30 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
+class LinearDecayWithRestartsLR(LambdaLR):
+    def __init__(self, optimizer, numstepsperphase:List[int]=None, startmult=1., endmult=0., verbose=False):
+        self.numstepsperphase = numstepsperphase
+        self.cumsteps = [0] + list(np.cumsum(self.numstepsperphase))
+        self.startmult = startmult
+        self.endmult = endmult
+        f = lambda step: self.compute_lr(step)
+        super().__init__(optimizer, f, verbose=verbose)
+
+    def compute_lr(self, step):
+        if step >= self.cumsteps[-1]:
+            return self.endmult
+        for i in range(len(self.cumsteps)-1):
+            if step < self.cumsteps[i+1]:
+                break   # found left boundary!
+        progress = (step - self.cumsteps[i]) / (self.cumsteps[i+1] - self.cumsteps[i])
+        ret = progress * self.endmult + (1 - progress) * self.startmult
+        return max(ret, self.endmult)
+
+
 def main(args):
-    DEBUG = True
+    DEBUG = False
     if DEBUG:
-        args.num_epochs = 1
+        args.num_epochs = 20
 
     outputdir = os.path.join(args.load_dir, args.output_subdir)
     logging_dir = os.path.join(outputdir, args.logging_dir)
@@ -330,7 +363,8 @@ def main(args):
         dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
 
     # select subset of dataset for debugging purposes
-    dataset = dataset.train_test_split(100)["test"]
+    if DEBUG:
+        dataset = dataset.train_test_split(100)["test"]
 
     if args.dataset_name == "cifar10":
         imgkey = "img"
@@ -348,44 +382,38 @@ def main(args):
         dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
     )
 
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps,
-        num_training_steps=(len(train_dataloader) * args.num_epochs) // args.gradient_accumulation_steps,
-    )
+    # parse distillation schedule
+    distillsched = [int(x) for x in args.distill_schedule.split(" ")]
+    distillsched = list(zip(distillsched[:-1], distillsched[1:]))
+    prevtimesteps = None
 
-    studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler, ddimsched = accelerator.prepare(
-        studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler, ddimsched
-    )
+    totalnumepochs = args.num_epochs
+    numphases = len(distillsched)
+    epochs_per_phase = [1/(numphases + 2) for _ in range(numphases-2)] + [2/(numphases + 2), 2/(numphases + 2)]
+    assert abs(sum(epochs_per_phase) - 1) <= 1e-4
+    epochs_per_phase = [int(math.ceil(totalnumepochs * i)) for i in epochs_per_phase]
+
+    print(f"Total number of epochs: {sum(epochs_per_phase)}")
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    updates_per_distillphase = [num_update_steps_per_epoch * i for i in epochs_per_phase]
+
+    lr_scheduler = None
+    if args.use_lr_schedule:
+        lr_scheduler = LinearDecayWithRestartsLR(
+            optimizer=optimizer, numstepsperphase=updates_per_distillphase)
+
+    studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler, ddimsched = accelerator.prepare(
+        studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler, ddimsched)
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(outputdir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            repo = Repository(outputdir, clone_from=repo_name)
-
-            with open(os.path.join(outputdir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif outputdir is not None:
+        if outputdir is not None:
             os.makedirs(outputdir, exist_ok=True)
 
     if accelerator.is_main_process:
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run)
-
-    # parse distillation schedule
-    distillsched = [int(x) for x in args.distill_schedule.split(" ")]
-    distillsched = list(zip(distillsched[:-1], distillsched[1:]))
-    prevtimesteps = None
 
     global_step = 0
 
@@ -397,6 +425,8 @@ def main(args):
         assert prevnumsteps / numsteps == prevnumsteps // numsteps, "Supporting only whole jump sizes"
         jumpsize = int(prevnumsteps / numsteps)
 
+        print(f"Distillation phase {distillphase+1}/{len(distillsched)}: {prevnumsteps} -> {numsteps} steps ({epochs_per_phase[distillphase]} epochs)")
+
         ddimsched.set_timesteps(prevnumsteps, prevtimesteps=prevtimesteps)
         futureddimsched = deepcopy(ddimsched)
         futureddimsched.set_timesteps(numsteps, prevtimesteps=ddimsched.timesteps)
@@ -404,9 +434,7 @@ def main(args):
         alphas_cumprod = ddimsched.alphas_cumprod
         full_alphas_cumprod = torch.cat([torch.tensor([1.], dtype=alphas_cumprod.dtype, device=alphas_cumprod.device), alphas_cumprod], 0)
 
-        # TODO: use linear decay LR schedule and reset it at every phase
-
-        for epoch in range(args.num_epochs):
+        for epoch in range(epochs_per_phase[distillphase]):
             studentmodel.train()
             teachermodel.eval()
             progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
@@ -487,9 +515,7 @@ def main(args):
                         alpha_t = _extract_into_tensor(full_alphas_cumprod, init_t+1, (x0.shape[0], 1, 1, 1))
                         snr_weights = alpha_t / (1 - alpha_t)           # use SNR weighting from distillation paper
                         snr_weights = snr_weights.clamp_min(1.)         # clipped SNR weighting
-                        loss = snr_weights * F.mse_loss(
-                            model_output, x0, reduction="none"
-                        )
+                        loss = snr_weights * F.mse_loss(model_output, target, reduction="none")
                         loss = loss.mean()
 
                     accelerator.backward(loss)
@@ -520,7 +546,7 @@ def main(args):
 
             # Generate sample images for visual inspection
             if accelerator.is_main_process:
-                if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+                if (epoch % args.save_images_epochs == 0 and epoch > 0) or epoch == epochs_per_phase[distillphase] - 1:
                     saved_pipeline = DistilledDDIMPipeline(
                         unet=accelerator.unwrap_model(ema_model.averaged_model if args.use_ema else studentmodel),
                         scheduler=futureddimsched,
@@ -538,7 +564,7 @@ def main(args):
                         "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
                     )
 
-                if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1 or args.store_model_epochs > 0 and epoch % args.store_model_epochs == 0:
+                # if epoch % args.save_model_epochs == 0 or epoch == epochs_per_phase[distillphase] - 1:
                     # save the model regularly and at the end of distillation phase
                     saved_pipeline.save_pretrained(outputdir)
 
@@ -562,7 +588,12 @@ def main(args):
         if accelerator.is_main_process:
             # if args.store_model_epochs > 0 and epoch % args.store_model_epochs == 0:
             # copy saved model
-            shutil.copytree(outputdir, outputdir + f"_{numsteps}steps")
+            targetdir = f"{outputdir}_{numsteps}steps"
+            if os.path.exists(targetdir):
+                print(f"Overwriting previous directory '{targetdir}'")
+                shutil.rmtree(targetdir)
+            print(f"Copying '{outputdir}' to '{targetdir}'")
+            shutil.copytree(outputdir, targetdir)
 
     accelerator.end_training()
 

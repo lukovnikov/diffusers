@@ -22,6 +22,7 @@ from typing import Optional, Tuple, Union
 import numpy as np
 import torch
 
+from .. import ModelMixin
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput
 from .scheduling_utils import SchedulerMixin
@@ -77,7 +78,7 @@ def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999) -> torch.Tensor
     return torch.tensor(betas)
 
 
-class DDIMScheduler(SchedulerMixin, ConfigMixin):
+class DDIMScheduler(ModelMixin, ConfigMixin, SchedulerMixin):
     """
     Denoising diffusion implicit models is a scheduler that extends the denoising procedure introduced in denoising
     diffusion probabilistic models (DDPMs) with non-Markovian guidance.
@@ -120,6 +121,8 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         "DPMSolverMultistepScheduler",
     ]
 
+    ignore_for_config = {"trained_betas"}
+
     @register_to_config
     def __init__(
         self,
@@ -133,38 +136,41 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         steps_offset: int = 0,
         predict_epsilon: bool = True,
     ):
+        super(DDIMScheduler, self).__init__()
         if trained_betas is not None:
-            self.betas = (
+            betas = (
                 torch.from_numpy(trained_betas) if not isinstance(trained_betas, torch.Tensor) else trained_betas
             )
         elif beta_schedule == "linear":
-            self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
+            betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = (
+            betas = (
                 torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
             )
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
-            self.betas = betas_for_alpha_bar(num_train_timesteps)
+            betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
 
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.register_buffer("betas", betas)
+
+        self.register_buffer("alphas",  1.0 - self.betas)
+        self.register_buffer("alphas_cumprod", torch.cumprod(self.alphas, dim=0))
 
         # At every step in ddim, we are looking into the previous alphas_cumprod
         # For the final step, there is no previous alphas_cumprod because we are already at 0
         # `set_alpha_to_one` decides whether we set this parameter simply to one or
         # whether we use the final alpha of the "non-previous" one.
-        self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
+        self.register_buffer("final_alpha_cumprod", torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0])
 
         # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
 
         # setable values
         self.num_inference_steps = None
-        self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
+        self.register_buffer("timesteps", torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64)))
 
     def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
         """
@@ -450,11 +456,6 @@ class DDIMExtendedScheduler(DDIMScheduler):
             returning a tuple, the first element is the sample tensor.
 
         """
-        if self.num_inference_steps is None:
-            raise ValueError(
-                "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
-            )
-
         # See formulas (12) and (16) of DDIM paper https://arxiv.org/pdf/2010.02502.pdf
         # Ideally, read DDIM paper in-detail understanding
 

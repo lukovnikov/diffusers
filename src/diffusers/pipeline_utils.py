@@ -47,6 +47,7 @@ from .utils import (
     is_transformers_available,
     logging,
 )
+from collections import OrderedDict
 
 
 if is_transformers_available():
@@ -63,12 +64,12 @@ logger = logging.get_logger(__name__)
 
 
 LOADABLE_CLASSES = {
-    "diffusers": {
-        "ModelMixin": ["save_pretrained", "from_pretrained"],
+    "diffusers": OrderedDict({
         "SchedulerMixin": ["save_config", "from_config"],
+        "ModelMixin": ["save_pretrained", "from_pretrained"],
         "DiffusionPipeline": ["save_pretrained", "from_pretrained"],
         "OnnxRuntimeModel": ["save_pretrained", "from_pretrained"],
-    },
+    }),
     "transformers": {
         "PreTrainedTokenizer": ["save_pretrained", "from_pretrained"],
         "PreTrainedTokenizerFast": ["save_pretrained", "from_pretrained"],
@@ -196,9 +197,9 @@ class DiffusionPipeline(ConfigMixin):
                     if class_candidate is not None and issubclass(model_cls, class_candidate):
                         # if we found a suitable base class in LOADABLE_CLASSES then grab its save method
                         save_method_name = save_load_methods[0]
-                        break
-                if save_method_name is not None:
-                    break
+                        # break
+                # if save_method_name is not None:
+                #     break
 
             save_method = getattr(sub_model, save_method_name)
             save_method(os.path.join(save_directory, pipeline_component_name))

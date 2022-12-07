@@ -32,6 +32,7 @@ if is_torch_available():
     from .pipelines import (
         DanceDiffusionPipeline,
         DDIMPipeline,
+        DistilledDDIMPipeline,
         DDPMPipeline,
         KarrasVePipeline,
         LDMPipeline,
@@ -42,6 +43,8 @@ if is_torch_available():
     )
     from .schedulers import (
         DDIMScheduler,
+        DDIMExtendedScheduler,
+        DistilledDDIMScheduler,
         DDPMScheduler,
         DPMSolverMultistepScheduler,
         EulerAncestralDiscreteScheduler,

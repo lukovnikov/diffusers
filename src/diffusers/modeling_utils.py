@@ -62,8 +62,12 @@ def get_parameter_device(parameter: torch.nn.Module):
             tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
             return tuples
 
-        gen = parameter._named_members(get_members_fn=find_tensor_attributes)
-        first_tuple = next(gen)
+        try:
+            gen = parameter._named_members(get_members_fn=find_tensor_attributes)
+            first_tuple = next(gen)
+        except StopIteration as e2:
+            gen = parameter.named_buffers()
+            first_tuple = next(gen)
         return first_tuple[1].device
 
 
@@ -77,8 +81,12 @@ def get_parameter_dtype(parameter: torch.nn.Module):
             tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
             return tuples
 
-        gen = parameter._named_members(get_members_fn=find_tensor_attributes)
-        first_tuple = next(gen)
+        try:
+            gen = parameter._named_members(get_members_fn=find_tensor_attributes)
+            first_tuple = next(gen)
+        except StopIteration as e2:
+            gen = parameter.named_buffers()
+            first_tuple = next(gen)
         return first_tuple[1].dtype
 
 

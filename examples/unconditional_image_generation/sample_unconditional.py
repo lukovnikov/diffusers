@@ -12,13 +12,14 @@ from diffusers.schedulers.scheduling_ddim import _ddim_scheduler_from_ddpm_sched
 
 
 def main(args):
-    pipeline = DiffusionPipeline.from_pretrained(args.loadmodel).to(
-        torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 else "cpu")
-    )
-
+    DEBUG = True
+    pipeline = DiffusionPipeline.from_pretrained(args.loadmodel)
     if args.sampler == "ddim":
         ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler)
         pipeline = DDIMPipeline(pipeline.unet, ddimsched)
+    pipeline = pipeline.to(torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 else "cpu"))
+
+    pipeline.scheduler.config.clip_sample = args.clip_sample
 
     num_steps = args.numsteps if args.numsteps != -1 else pipeline.scheduler.num_train_timesteps
     print(f"Number of timesteps used for sampling: {num_steps}")
@@ -90,6 +91,7 @@ if __name__ == "__main__":
     parser.add_argument("--outputsubdir", type=str, default=None)
     parser.add_argument("--numsamples", type=int, default=10)
     parser.add_argument("--gpu", type=int, default=-1)
+    parser.add_argument("--clip_sample", action="store_true", default=False)
 
     args = parser.parse_args()
     if args.savedir is None:

@@ -314,12 +314,13 @@ def main(args):
     )
 
     pipeline = DiffusionPipeline.from_pretrained(args.load_dir)
-    teachermodel = pipeline.unet
+    studentmodel = pipeline.unet
     originalscheduler = pipeline.scheduler
     ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler, _class=DistilledDDIMScheduler)
     pipeline.scheduler = ddimsched
+    ddimsched.config.clip_sample = False
 
-    print(f"Number of parameters: {count_parameters(teachermodel)//1e6:.2f}M")
+    print(f"Number of parameters: {count_parameters(studentmodel)//1e6:.2f}M")
 
     # accepts_predict_epsilon = "predict_epsilon" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
     #
@@ -331,8 +332,6 @@ def main(args):
     #     )
     # else:
     #     noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
-
-    studentmodel = deepcopy(teachermodel)
 
     optimizer = torch.optim.AdamW(
         studentmodel.parameters(),
@@ -403,8 +402,8 @@ def main(args):
         lr_scheduler = LinearDecayWithRestartsLR(
             optimizer=optimizer, numstepsperphase=updates_per_distillphase)
 
-    studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler, ddimsched = accelerator.prepare(
-        studentmodel, teachermodel, optimizer, train_dataloader, lr_scheduler, ddimsched)
+    studentmodel, optimizer, train_dataloader, lr_scheduler, ddimsched = accelerator.prepare(
+        studentmodel, optimizer, train_dataloader, lr_scheduler, ddimsched)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -434,6 +433,9 @@ def main(args):
         alphas_cumprod = ddimsched.alphas_cumprod
         full_alphas_cumprod = torch.cat([torch.tensor([1.], dtype=alphas_cumprod.dtype, device=alphas_cumprod.device), alphas_cumprod], 0)
 
+        # initialize teacher model for next phase from student of previous phase
+        teachermodel = deepcopy(studentmodel)
+
         for epoch in range(epochs_per_phase[distillphase]):
             studentmodel.train()
             teachermodel.eval()
@@ -454,7 +456,6 @@ def main(args):
 
                 # run original pipeline for few steps on noisy images
                 timestepselect = torch.randint(0, ((oldtimesteps.size(0) - 1) // jumpsize), (bsz,)) * jumpsize
-                # timestepselect = torch.randint(0, newtimesteps.size(0), (bsz,))
                 init_t = oldtimesteps[timestepselect]
                 assert ((init_t[:, None] == newtimesteps[None, :]).any(1).all())
 

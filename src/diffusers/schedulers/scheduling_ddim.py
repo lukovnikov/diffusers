@@ -424,7 +424,7 @@ class DDIMExtendedScheduler(DDIMScheduler):
         timestep: Tuple[torch.Tensor, torch.Tensor],
         sample: torch.FloatTensor,
         eta: float = 0.0,
-        use_clipped_model_output: bool = False,
+        use_clipped_model_output: bool = True,
         generator=None,
         variance_noise: Optional[torch.FloatTensor] = None,
         return_dict: bool = True,
@@ -493,28 +493,30 @@ class DDIMExtendedScheduler(DDIMScheduler):
         # 3. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
         if self.config.predict_epsilon:
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            eps_pred = model_output
+            x0_pred = (sample - beta_prod_t ** (0.5) * eps_pred) / alpha_prod_t ** (0.5)
         else:
-            pred_original_sample = model_output
+            x0_pred = model_output
+            eps_pred = (sample - alpha_prod_t ** (0.5) * x0_pred) / beta_prod_t ** (0.5)
 
         # 4. Clip "predicted x_0"
         if self.config.clip_sample:
-            pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
+            x0_pred = torch.clamp(x0_pred, -1, 1)
+            # recompute eps pred
+            if use_clipped_model_output:
+                # the model_output is always re-derived from the clipped x_0 in Glide
+                eps_pred = (sample - alpha_prod_t ** (0.5) * x0_pred) / beta_prod_t ** (0.5)
 
         # 5. compute variance: "sigma_t(η)" -> see formula (16)
         # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
         variance = (beta_prod_tm1 / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_tm1)
         std_dev_t = eta * variance ** (0.5)
 
-        if use_clipped_model_output:
-            # the model_output is always re-derived from the clipped x_0 in Glide
-            model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
-
         # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        pred_sample_direction = (1 - alpha_prod_tm1 - std_dev_t**2) ** (0.5) * model_output
+        pred_sample_direction = (1 - alpha_prod_tm1 - std_dev_t**2) ** (0.5) * eps_pred
 
         # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        prev_sample = alpha_prod_tm1 ** (0.5) * pred_original_sample + pred_sample_direction
+        prev_sample = alpha_prod_tm1 ** (0.5) * x0_pred + pred_sample_direction
 
         if eta > 0:
             # randn_like does not support generator https://github.com/pytorch/pytorch/issues/27072
@@ -542,7 +544,7 @@ class DDIMExtendedScheduler(DDIMScheduler):
         if not return_dict:
             return (prev_sample,)
 
-        return DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
+        return DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=x0_pred)
 
 
 class DistilledDDIMScheduler(DDIMExtendedScheduler):

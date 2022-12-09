@@ -318,7 +318,7 @@ def main(args):
     originalscheduler = pipeline.scheduler
     ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler, _class=DistilledDDIMScheduler)
     pipeline.scheduler = ddimsched
-    ddimsched.config.clip_sample = False
+    ddimsched.config.clip_sample = True     # setting this to False resulted in blown up extreme values on flowers
 
     print(f"Number of parameters: {count_parameters(studentmodel)//1e6:.2f}M")
 

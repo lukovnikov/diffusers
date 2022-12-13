@@ -193,6 +193,12 @@ def parse_args():
         default=True,
         help="Whether to use Exponential Moving Average for the final model weights.",
     )
+    parser.add_argument(
+        "--no_ema",
+        dest="use_ema",
+        action="store_false",
+        help=""
+    )
     parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
     parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
     parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
@@ -417,8 +423,9 @@ def main(args):
     global_step = 0
 
     for distillphase in range(len(distillsched)):
-        ema_model = EMAModel(studentmodel, inv_gamma=args.ema_inv_gamma, power=args.ema_power,
-                             max_value=args.ema_max_decay)
+        if args.use_ema:
+            ema_model = EMAModel(studentmodel, inv_gamma=args.ema_inv_gamma, power=args.ema_power,
+                                 max_value=args.ema_max_decay)
 
         prevnumsteps, numsteps = distillsched[distillphase]
         assert prevnumsteps / numsteps == prevnumsteps // numsteps, "Supporting only whole jump sizes"
@@ -456,6 +463,8 @@ def main(args):
 
                 # run original pipeline for few steps on noisy images
                 timestepselect = torch.randint(0, ((oldtimesteps.size(0) - 1) // jumpsize), (bsz,)) * jumpsize
+                # if True:        # DEBUG
+                #     timestepselect.fill_(timestepselect.max())
                 init_t = oldtimesteps[timestepselect]
                 assert ((init_t[:, None] == newtimesteps[None, :]).any(1).all())
 
@@ -510,7 +519,7 @@ def main(args):
                     # Predict the noise residual or original image
                     model_output = studentmodel(x_t, init_t).sample
 
-                    if originalscheduler.config.predict_epsilon:
+                    if originalscheduler.config.predict_epsilon:        # DEBUG
                         loss = F.mse_loss(model_output, target)  # this could have different weights!
                     else:
                         alpha_t = _extract_into_tensor(full_alphas_cumprod, init_t+1, (x0.shape[0], 1, 1, 1))
@@ -562,7 +571,7 @@ def main(args):
                     # denormalize the images and save to tensorboard
                     images_processed = (images * 255).round().astype("uint8")
                     accelerator.trackers[0].writer.add_images(
-                        "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
+                        "test_samples", images_processed.transpose(0, 3, 1, 2), global_step,
                     )
 
                 # if epoch % args.save_model_epochs == 0 or epoch == epochs_per_phase[distillphase] - 1:

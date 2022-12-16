@@ -178,9 +178,9 @@ def parse_args():
         action="store_false",
         help="Whether to not use linear decay lr schedule in every distillation phase."
     )
-    # parser.add_argument(
-    #     "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
-    # )
+    parser.add_argument(
+        "--lr_warmup_frac", type=float, default=0.1, help="Fraction of distillation steps per phase to use for linear warmup of LR."
+    )
     parser.add_argument("--adam_beta1", type=float, default=0.95, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument(
@@ -286,12 +286,14 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 
 class LinearDecayWithRestartsLR(LambdaLR):
-    def __init__(self, optimizer, numstepsperphase:List[int]=None, startmult=1., endmult=0., verbose=False):
+    def __init__(self, optimizer, numstepsperphase:List[int]=None, startmult=1., endmult=0., warmup=0., verbose=False):
         self.numstepsperphase = numstepsperphase
         self.cumsteps = [0] + list(np.cumsum(self.numstepsperphase))
         self.startmult = startmult
         self.endmult = endmult
+        self.warmup = warmup
         f = lambda step: self.compute_lr(step)
+
         super().__init__(optimizer, f, verbose=verbose)
 
     def compute_lr(self, step):
@@ -300,9 +302,16 @@ class LinearDecayWithRestartsLR(LambdaLR):
         for i in range(len(self.cumsteps)-1):
             if step < self.cumsteps[i+1]:
                 break   # found left boundary!
+
         progress = (step - self.cumsteps[i]) / (self.cumsteps[i+1] - self.cumsteps[i])
-        ret = progress * self.endmult + (1 - progress) * self.startmult
-        return max(ret, self.endmult)
+        if progress < self.warmup:
+            subprogress = progress / self.warmup
+            startmult, endmult = self.endmult, self.startmult
+        else:
+            subprogress = (progress - self.warmup) / (1 - self.warmup)
+            endmult, startmult = self.endmult, self.startmult
+        ret = subprogress * endmult + (1 - subprogress) * startmult
+        return min(max(ret, self.endmult), self.startmult)
 
 
 def main(args):
@@ -324,7 +333,7 @@ def main(args):
     originalscheduler = pipeline.scheduler
     ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler, _class=DistilledDDIMScheduler)
     pipeline.scheduler = ddimsched
-    ddimsched.config.clip_sample = True     # setting this to False resulted in blown up extreme values on flowers
+    ddimsched.config.clip_sample = False
 
     print(f"Number of parameters: {count_parameters(studentmodel)//1e6:.2f}M")
 
@@ -406,7 +415,7 @@ def main(args):
     lr_scheduler = None
     if args.use_lr_schedule:
         lr_scheduler = LinearDecayWithRestartsLR(
-            optimizer=optimizer, numstepsperphase=updates_per_distillphase)
+            optimizer=optimizer, numstepsperphase=updates_per_distillphase, warmup=args.lr_warmup_frac)
 
     studentmodel, optimizer, train_dataloader, lr_scheduler, ddimsched = accelerator.prepare(
         studentmodel, optimizer, train_dataloader, lr_scheduler, ddimsched)
@@ -442,6 +451,26 @@ def main(args):
 
         # initialize teacher model for next phase from student of previous phase
         teachermodel = deepcopy(studentmodel)
+        optimizer = torch.optim.AdamW(
+            studentmodel.parameters(),
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+        if False:       # use rmsprop without momentum?
+            optimizer = torch.optim.RMSprop(
+                studentmodel.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.adam_weight_decay,
+                eps=args.adam_epsilon,
+            )
+        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1., total_iters=updates_per_distillphase)
+        if args.use_lr_schedule:
+            lr_scheduler = LinearDecayWithRestartsLR(
+                optimizer=optimizer, numstepsperphase=updates_per_distillphase, warmup=args.lr_warmup_frac)
+
+        optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
 
         for epoch in range(epochs_per_phase[distillphase]):
             studentmodel.train()
@@ -466,17 +495,19 @@ def main(args):
                 # if True:        # DEBUG
                 #     timestepselect.fill_(timestepselect.max())
                 init_t = oldtimesteps[timestepselect]
-                assert ((init_t[:, None] == newtimesteps[None, :]).any(1).all())
+                assert ((oldtimesteps[timestepselect][:, None] == newtimesteps[None, :]).any(1).all())
 
                 # Add noise to the clean images according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 # alphas_cumprod = alphas_cumprod.to(x0.device)
                 full_alphas_cumprod = full_alphas_cumprod.to(x0.device)
-                alpha_bar_t = _extract_into_tensor(full_alphas_cumprod, init_t+1, x0.shape)
+                alpha_bar_t = _extract_into_tensor(full_alphas_cumprod, oldtimesteps[timestepselect]+1, x0.shape)  # - because full_alphas_cumprod starts with 1.0 for timestep -1
                 x_t = alpha_bar_t.sqrt() * x0 + (1 - alpha_bar_t).sqrt() * noise
                 # _x_t = originalscheduler.add_noise(x0, noise, init_t)
 
                 x_tmk = x_t
+
+                max_teacher_model_output = 0
 
                 with torch.no_grad():
                     # run original sampler for a few steps
@@ -484,6 +515,7 @@ def main(args):
                         start_t, end_t = oldtimesteps[timestepselect + substep_i], oldtimesteps[timestepselect + substep_i + 1]
                         # 1. predict noise model_output
                         model_output = teachermodel(x_tmk, start_t).sample
+                        max_teacher_model_output = max(max_teacher_model_output, model_output.abs().max())
 
                         # 2. predict previous mean of image x_t-1 and add variance depending on eta
                         # eta corresponds to η in paper and should be between [0, 1]
@@ -495,11 +527,11 @@ def main(args):
 
                 # compute target eps or x0:
                 #   last 'image' from previous steps gives the target x_tm1
+                alpha_bar_t =  _extract_into_tensor(full_alphas_cumprod, init_t+1, x0.shape)
+                alpha_bar_tmX = _extract_into_tensor(full_alphas_cumprod, end_t+1, x0.shape)
                 if originalscheduler.config.predict_epsilon:
                     # sqrt_recip_alphas_cumprod_t = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, jump_start_t, x_t.shape)
                     # sqrt_recipm1_alphas_cumprod_t = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, jump_start_t, x_t.shape)
-                    alpha_bar_t =  _extract_into_tensor(full_alphas_cumprod, init_t+1, x0.shape)
-                    alpha_bar_tmX = _extract_into_tensor(full_alphas_cumprod, end_t+1, x0.shape)
                     # eps_star = (x_tmX - alpha_bar_tmX.sqrt() * sqrt_recip_alphas_cumprod_t * x_t) / \
                     #            ((1-alpha_bar_tmX).sqrt() -  alpha_bar_tmX.sqrt() * sqrt_recipm1_alphas_cumprod_t)
                     eps_star = (x_tmk - (alpha_bar_tmX / alpha_bar_t).sqrt() * x_t) / \
@@ -508,8 +540,6 @@ def main(args):
                     # _x0_star = (x_t - (1-alpha_bar_t).sqrt()*eps_star)/alpha_bar_t.sqrt()
                     # _test = ((alpha_bar_tmX.sqrt() * _x0_star + (1 - alpha_bar_tmX).sqrt() * eps_star) - x_tmk).abs().max()
                 else:
-                    alpha_bar_t =  _extract_into_tensor(full_alphas_cumprod, init_t+1, x0.shape)
-                    alpha_bar_tmX = _extract_into_tensor(full_alphas_cumprod, end_t+1, x0.shape)
                     x0_star = (x_tmk - ((1 - alpha_bar_tmX) / (1 - alpha_bar_t)).sqrt() * x_t) /\
                               (alpha_bar_tmX.sqrt() - (alpha_bar_t * (1 - alpha_bar_tmX) / (1 - alpha_bar_t)).sqrt())
                     target = x0_star
@@ -518,8 +548,9 @@ def main(args):
                 with accelerator.accumulate(studentmodel):
                     # Predict the noise residual or original image
                     model_output = studentmodel(x_t, init_t).sample
+                    max_student_model_output = model_output.abs().max()
 
-                    if originalscheduler.config.predict_epsilon:        # DEBUG
+                    if True or originalscheduler.config.predict_epsilon:        # DEBUG
                         loss = F.mse_loss(model_output, target)  # this could have different weights!
                     else:
                         alpha_t = _extract_into_tensor(full_alphas_cumprod, init_t+1, (x0.shape[0], 1, 1, 1))
@@ -545,7 +576,7 @@ def main(args):
                     global_step += 1
 
                 logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0],
-                        "gradnorm": gradnorm, "step": global_step}
+                        "gradnorm": gradnorm, "mtmo": max_teacher_model_output.detach().item(), "msmo": max_student_model_output.detach().item(), "step": global_step}
                 if args.use_ema:
                     logs["ema_decay"] = ema_model.decay
                 progress_bar.set_postfix(**logs)

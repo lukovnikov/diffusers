@@ -44,13 +44,14 @@ def main(args):
                 generator=generator,
                 batch_size=args.batchsize,
                 output_type="numpy",
+                num_inference_steps=num_steps,
             ).images
         elif isinstance(pipeline, DDIMPipeline):
             images = pipeline(
                 generator=generator,
                 batch_size=args.batchsize,
                 output_type="numpy",
-                num_inference_steps=args.numsteps,
+                num_inference_steps=num_steps,
                 use_clipped_model_output=True,
                 eta=args.ddimeta,
             ).images
@@ -59,7 +60,7 @@ def main(args):
                 generator=generator,
                 batch_size=args.batchsize,
                 output_type="numpy",
-                num_inference_steps=args.numsteps,
+                num_inference_steps=num_steps,
                 eta=args.ddimeta,
             ).images
 

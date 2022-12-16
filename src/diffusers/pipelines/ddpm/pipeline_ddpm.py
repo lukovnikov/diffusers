@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 
 from typing import Optional, Tuple, Union
 
@@ -47,6 +47,8 @@ class DDPMPipeline(DiffusionPipeline):
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         predict_epsilon: bool = True,
+        image=None,
+        timerange=None,
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
@@ -82,16 +84,21 @@ class DDPMPipeline(DiffusionPipeline):
             self.scheduler._internal_dict = FrozenDict(new_config)
 
         # Sample gaussian noise to begin loop
-        image = torch.randn(
-            (batch_size, self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
-            generator=generator,
-        )
+        if image is None:
+            image = torch.randn(
+                (batch_size, self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
+                generator=generator,
+            )
         image = image.to(self.device)
 
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
+        timesteps = self.scheduler.timesteps
 
-        for t in self.progress_bar(self.scheduler.timesteps):
+        if timerange is not None:
+            timesteps = torch.masked_select(timesteps, (timesteps >= timerange[1]) * (timesteps < timerange[0]))
+
+        for t in self.progress_bar(timesteps):
             # 1. predict noise model_output
             model_output = self.unet(image, t).sample
 
@@ -99,6 +106,99 @@ class DDPMPipeline(DiffusionPipeline):
             image = self.scheduler.step(
                 model_output, t, image, generator=generator, predict_epsilon=predict_epsilon
             ).prev_sample
+
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = image.cpu().permute(0, 2, 3, 1).numpy()
+        if output_type == "pil":
+            image = self.numpy_to_pil(image)
+
+        if not return_dict:
+            return (image,)
+
+        return ImagePipelineOutput(images=image)
+
+
+
+class PiecewiseDDPMPipeline(DiffusionPipeline):
+    r"""
+    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
+    library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
+
+    Parameters:
+        unet ([`UNet2DModel`]): U-Net architecture to denoise the encoded image.
+        scheduler ([`SchedulerMixin`]):
+            A scheduler to be used in combination with `unet` to denoise the encoded image. Can be one of
+            [`DDPMScheduler`], or [`DDIMScheduler`].
+    """
+
+    def __init__(self, phase_specs, loaddir):
+        super(PiecewiseDDPMPipeline, self).__init__()
+        self.loaddir = loaddir
+        self.specs = phase_specs
+        subpipeline = DDPMPipeline.from_pretrained(os.path.join(self.loaddir, f"phase0"))
+        self.register_modules(unet=subpipeline.unet, scheduler=subpipeline.scheduler)
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        batch_size: int = 1,
+        generator: Optional[torch.Generator] = None,
+        num_inference_steps: int = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        predict_epsilon: bool = None,
+        image=None,
+        **kwargs,
+    ) -> Union[ImagePipelineOutput, Tuple]:
+        r"""
+        Args:
+            batch_size (`int`, *optional*, defaults to 1):
+                The number of images to generate.
+            generator (`torch.Generator`, *optional*):
+                A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
+                deterministic.
+            num_inference_steps (`int`, *optional*, defaults to 1000):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipeline_utils.ImagePipelineOutput`] instead of a plain tuple.
+
+        Returns:
+            [`~pipeline_utils.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if
+            `return_dict` is True, otherwise a `tuple. When returning a tuple, the first element is a list with the
+            generated images.
+        """
+        message = (
+            "Please make sure to instantiate your scheduler with `predict_epsilon` instead. E.g. `scheduler ="
+            " DDPMScheduler.from_config(<model_id>, predict_epsilon=True)`."
+        )
+        predict_epsilon = deprecate("predict_epsilon", "0.10.0", message, take_from=kwargs)
+
+        if predict_epsilon is not None:
+            new_config = dict(self.scheduler.config)
+            new_config["predict_epsilon"] = predict_epsilon
+            self.scheduler._internal_dict = FrozenDict(new_config)
+
+        # Sample gaussian noise to begin loop
+        if image is None:
+            image = torch.randn(
+                (batch_size, self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
+                generator=generator,
+            )
+        image = image.to(self.device)
+
+        for phase in sorted(self.specs.keys()):
+            subpipeline = DDPMPipeline.from_pretrained(os.path.join(self.loaddir, f"phase{phase}"))
+            self.register_modules(unet=subpipeline.unet.to(self.device), scheduler=subpipeline.scheduler)
+
+            for t in self.progress_bar(range(self.specs[phase][1], self.specs[phase][0])[::-1]):
+                model_output = subpipeline.unet(image, t).sample
+                image = subpipeline.scheduler.step(model_output, t, image, generator=generator,
+                                                   predict_epsilon=predict_epsilon).prev_sample
+
 
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()

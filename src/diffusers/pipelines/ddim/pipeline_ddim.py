@@ -110,9 +110,10 @@ class DDIMPipeline(DiffusionPipeline):
             # 2. predict previous mean of image x_t-1 and add variance depending on eta
             # eta corresponds to η in paper and should be between [0, 1]
             # do x_t -> x_t-1
-            image = self.scheduler.step(
+            schedout = self.scheduler.step(
                 model_output, t, image, eta, **extra_kwargs
-            ).prev_sample
+            )
+            image = schedout.prev_sample
 
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()

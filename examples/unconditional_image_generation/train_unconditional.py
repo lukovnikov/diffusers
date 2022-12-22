@@ -235,6 +235,10 @@ def parse_args():
     if args.resolution is None:  # resolution default
         if args.dataset_name == "cifar10":
             args.resolution = 32
+        elif args.dataset_name.endswith("-128"):
+            args.resolution = 128
+        elif args.dataset_name.endswith("-256"):
+            args.resolution = 256
         else:
             args.resolution = 64
 
@@ -293,6 +297,30 @@ def main(args):
                 "UpBlock2D",
                 "UpBlock2D",
                 "AttnUpBlock2D",
+                "UpBlock2D",
+            ),
+            use_scale_shift_norm=True,
+        )
+    if args.resolution == 128:
+        model = UNet2DModel(
+            sample_size=args.resolution,
+            in_channels=3,
+            out_channels=3,
+            layers_per_block=2,
+            dropout=args.dropout,
+            block_out_channels=(64, 128, 256, 192*2, 192*4),
+            down_block_types=(
+                "DownBlock2D",
+                "DownBlock2D",
+                "DownBlock2D",
+                "AttnDownBlock2D",
+                "AttnDownBlock2D",
+            ),
+            up_block_types=(
+                "AttnUpBlock2D",
+                "AttnUpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
                 "UpBlock2D",
             ),
             use_scale_shift_norm=True,
@@ -363,7 +391,7 @@ def main(args):
             split="train",
         )
     else:
-        dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
+        dataset = load_dataset(os.path.join(args.train_data_dir, "train"), cache_dir=args.cache_dir)["train"]  #"imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
 
     if args.dataset_name == "cifar10":
         imgkey = "img"
@@ -380,6 +408,9 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
     )
+
+    if args.lr_warmup_steps > 0 and args.lr_scheduler == "constant":
+        args.lr_scheduler = "constant_with_warmup"
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -424,6 +455,9 @@ def main(args):
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(train_dataloader):
             clean_images = batch["input"]
+
+            # clean_oor = torch.sum(clean_images.abs() > 0.98, (1, 2, 3)) / torch.sum(clean_images.abs() > 0, (1, 2, 3))
+            # clean_oor = clean_oor.max()
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape).to(clean_images.device)
             bsz = clean_images.shape[0]
@@ -439,6 +473,8 @@ def main(args):
             with accelerator.accumulate(model):
                 # Predict the noise residual
                 model_output = model(noisy_images, timesteps).sample
+                # model_oor = torch.sum(model_output.abs() > 0.98, (1, 2, 3)) / torch.sum(model_output.abs() > 0, (1, 2, 3))
+                # model_oor = model_oor.max()
 
                 if args.predict_epsilon:
                     loss = F.mse_loss(model_output, noise)  # this could have different weights!
@@ -447,6 +483,7 @@ def main(args):
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
+                    snr_weights.clamp_(.1, 2e2)         # custom clamp
                     loss = snr_weights * F.mse_loss(
                         model_output, clean_images, reduction="none"
                     )  # use SNR weighting from distillation paper
@@ -469,7 +506,8 @@ def main(args):
                 global_step += 1
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0],
-                    "gradnorm": gradnorm, "step": global_step}
+                    "gradnorm": gradnorm,
+                    "step": global_step}
             if args.use_ema:
                 logs["ema_decay"] = ema_model.decay
             progress_bar.set_postfix(**logs)

@@ -333,7 +333,7 @@ def main(args):
     originalscheduler = pipeline.scheduler
     ddimsched = _ddim_scheduler_from_ddpm_scheduler(pipeline.scheduler, _class=DistilledDDIMScheduler)
     pipeline.scheduler = ddimsched
-    ddimsched.config.clip_sample = False
+    ddimsched.config.clip_sample = True        # DEBUG only: TODO: put back to True
 
     print(f"Number of parameters: {count_parameters(studentmodel)//1e6:.2f}M")
 
@@ -458,13 +458,6 @@ def main(args):
             weight_decay=args.adam_weight_decay,
             eps=args.adam_epsilon,
         )
-        if False:       # use rmsprop without momentum?
-            optimizer = torch.optim.RMSprop(
-                studentmodel.parameters(),
-                lr=args.learning_rate,
-                weight_decay=args.adam_weight_decay,
-                eps=args.adam_epsilon,
-            )
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1., total_iters=updates_per_distillphase)
         if args.use_lr_schedule:
             lr_scheduler = LinearDecayWithRestartsLR(
@@ -485,6 +478,45 @@ def main(args):
                 noise = torch.randn(x0.shape).to(x0.device)
                 bsz = x0.shape[0]
 
+                # region debug code: verify that we are following the same trajectory if we compute x0_preds in the same way from beginning
+                # oldtimesteps = ddimsched.timesteps.to(noise.device)
+                # oldtimesteps = torch.cat([oldtimesteps, torch.tensor([-1], device=oldtimesteps.device, dtype=oldtimesteps.dtype)])
+                # init_t = oldtimesteps.max()
+                # full_alphas_cumprod = full_alphas_cumprod.to(x0.device)
+                # alpha_bar_t = _extract_into_tensor(full_alphas_cumprod, init_t, x0.shape)  # - because full_alphas_cumprod starts with 1.0 for timestep -1
+                # x_t = alpha_bar_t.sqrt() * x0 + (1 - alpha_bar_t).sqrt() * noise
+                # trajectories = [x_t]
+                # trajectories_distilltarget = [x_t]
+                # with torch.no_grad():
+                #     # compute trajectories for teacher
+                #     start_t = init_t
+                #     while bool(torch.all(start_t >= 0)):
+                #         end_t = start_t - 1
+                #         model_output = teachermodel(trajectories[-1], start_t).sample
+                #         schedout = ddimsched.step(model_output, (start_t, end_t), trajectories[-1], 0.)
+                #         trajectories.append(schedout.prev_sample)
+                #         start_t = end_t
+                #
+                #     start_t = init_t
+                #     i = 0
+                #     """
+                #     while start_t >= 0:
+                #         end_t = start_t + 2
+                #         # compute target eps or x0:
+                #         #   last 'image' from previous steps gives the target x_tm1
+                #         alpha_bar_start = _extract_into_tensor(full_alphas_cumprod, start_t + 1, x0.shape)
+                #         alpha_bar_end = _extract_into_tensor(full_alphas_cumprod, end_t + 1, x0.shape)
+                #         x0_star = (trajectories[i] - ((1 - alpha_bar_end) / (1 - alpha_bar_start)).sqrt() * trajectories_distilltarget[-1]) / \
+                #                   (alpha_bar_end.sqrt() - (
+                #                               alpha_bar_start * (1 - alpha_bar_end) / (1 - alpha_bar_start)).sqrt())
+                #         start_t = end_t
+                #         i += 2
+                #     """
+
+
+                # endregion
+
+                # region normal code
                 oldtimesteps = ddimsched.timesteps.to(noise.device)
                 oldtimesteps = torch.cat([oldtimesteps, torch.tensor([-1], device=oldtimesteps.device, dtype=oldtimesteps.dtype)])
                 newtimesteps = futureddimsched.timesteps.to(noise.device)
@@ -516,6 +548,9 @@ def main(args):
                         # 1. predict noise model_output
                         model_output = teachermodel(x_tmk, start_t).sample
                         max_teacher_model_output = max(max_teacher_model_output, model_output.abs().max())
+                        # model_output /= max(1., model_output.abs().max())
+                        # if distillphase == 0:
+                        #     model_output *= 0.8
 
                         # 2. predict previous mean of image x_t-1 and add variance depending on eta
                         # eta corresponds to η in paper and should be between [0, 1]
@@ -543,6 +578,8 @@ def main(args):
                     x0_star = (x_tmk - ((1 - alpha_bar_tmX) / (1 - alpha_bar_t)).sqrt() * x_t) /\
                               (alpha_bar_tmX.sqrt() - (alpha_bar_t * (1 - alpha_bar_tmX) / (1 - alpha_bar_t)).sqrt())
                     target = x0_star
+                    _pred_noise = (x_tmk - alpha_bar_tmX.sqrt() * x0_star) / (1 - alpha_bar_tmX).sqrt()
+                    _x_tmk = alpha_bar_tmX.sqrt() * x0_star + (1 - alpha_bar_tmX).sqrt() * _pred_noise
 
                 # run student model
                 with accelerator.accumulate(studentmodel):
@@ -581,6 +618,7 @@ def main(args):
                     logs["ema_decay"] = ema_model.decay
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
+                # endregion
             progress_bar.close()
 
             accelerator.wait_for_everyone()

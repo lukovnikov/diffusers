@@ -407,6 +407,8 @@ def main(args):
             del pipeline
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        else:
+            logger.info("Using already sampled images.")
 
     # Handle the repository creation
     if accelerator.is_main_process:

@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 from typing import Optional
+import subprocess
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
+from diffusers.models.attention import BasicTransformerBlock
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
@@ -24,6 +26,23 @@ from transformers import AutoTokenizer, PretrainedConfig
 
 
 logger = get_logger(__name__)
+
+
+def execute(cmd):
+    popen = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+    for stdout_line in iter(popen.stdout.readline, ""):
+        yield stdout_line
+    popen.stdout.close()
+    return_code = popen.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, cmd)
+
+
+def count_parameters(model):
+    if isinstance(model, torch.nn.Module):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    else:   # assuming iterable of parameters
+        return sum(p.numel() for p in model)
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str):
@@ -145,6 +164,10 @@ def parse_args(input_args=None):
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every X updates steps.")
+    parser.add_argument("--generate_every", type=int, default=500, help="Generate images using script every X updates steps.")
+    parser.add_argument("--generate_script", type=str, default="generate_during_train_script.py", help="Script to use to generate during training.")
+    parser.add_argument("--generate_concept", type=str, default="xvw", help="The name of the concept to be pasted into prompts from generation script.")
+    parser.add_argument("--generate_concept_class", type=str, default="xvw", help="The name of the concept class to be pasted into prompts from generation script.")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -217,6 +240,16 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+
+    parser.add_argument(
+        "--train_kv_emb_only", action="store_true", help="When enabled, only KV params of cross-attentions are trained, as well as the parameters of the special token(s)"
+    )
+    parser.add_argument(
+        "--finetune_token",
+        type=str,
+        default="hta sigue lun httr dits hmv",      # default collection
+        help="Which token to finetune when using '--train_kv_emb_only'."
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -489,9 +522,33 @@ def main(args):
     else:
         optimizer_class = torch.optim.AdamW
 
-    params_to_optimize = (
+
+    params_to_optimize = list(
         itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_text_encoder else unet.parameters()
     )
+    allparamstooptimize = list(params_to_optimize)
+
+    if args.train_kv_emb_only:
+        # train token embeddings of text encoder --> we need to zero out all words except the finetuned one(s), if it's specified
+        params_to_optimize = [text_encoder.text_model.embeddings.token_embedding.weight]
+        for submodule in unet.modules():
+            if isinstance(submodule, BasicTransformerBlock):
+                # include cross attention
+                params_to_optimize += list(submodule.attn2.to_k.parameters())
+                params_to_optimize += list(submodule.attn2.to_v.parameters())
+                # if transformer is purely cross attention, train other attn module too
+                if submodule.only_cross_attention:
+                    params_to_optimize += list(submodule.attn1.to_k.parameters())
+                    params_to_optimize += list(submodule.attn1.to_v.parameters())
+        if args.finetune_token is not None:
+            embedding_gradient_mask = torch.zeros_like(text_encoder.text_model.embeddings.token_embedding.weight[:, 0:1])
+            tokenids = tokenizer.encode(args.finetune_token)[1:-1]
+            for token in tokenids:
+                embedding_gradient_mask[token] = 1
+            text_encoder.text_model.embeddings.token_embedding.register_buffer("gradmask", embedding_gradient_mask)
+
+    print(f"#Params to optimize: {count_parameters(list(params_to_optimize))//1e6:.1f}M/{count_parameters(list(allparamstooptimize))//1e6:.1f}M")
+
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -659,6 +716,11 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
+
+                    if args.train_kv_emb_only and hasattr(text_encoder.text_model.embeddings.token_embedding, "gradmask"):
+                        # apply gradmask on embedding if train_kv_emb_only
+                        text_encoder.text_model.embeddings.token_embedding.weight.grad *= text_encoder.text_model.embeddings.token_embedding.gradmask
+
                     params_to_clip = (
                         itertools.chain(unet.parameters(), text_encoder.parameters())
                         if args.train_text_encoder
@@ -684,6 +746,25 @@ def main(args):
                         )
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         pipeline.save_pretrained(save_path)
+
+                if args.generate_every > 0 and global_step % args.generate_every == 0:
+                    if accelerator.is_main_process:
+                        pipeline = DiffusionPipeline.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            unet=accelerator.unwrap_model(unet),
+                            text_encoder=accelerator.unwrap_model(text_encoder),
+                            revision=args.revision,
+                        )
+                        pipeline.save_pretrained(args.output_dir)
+                        print("generating")
+                        # run generator script command
+                        import subprocess
+                        subp = subprocess.Popen(["python", args.generate_script,
+                                          "--outputdir", args.output_dir,
+                                          "--step", str(global_step),
+                                          "--concept", args.generate_concept,
+                                          "--conceptclass", args.generate_concept_class,])
+                        subp.communicate()  # wait until generation script finishes
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

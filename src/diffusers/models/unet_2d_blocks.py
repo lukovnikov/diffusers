@@ -618,6 +618,7 @@ class CrossAttnDownBlock2D(nn.Module):
         for resnet, attn in zip(self.resnets, self.attentions):
             if self.training and self.gradient_checkpointing:
 
+                """
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
@@ -626,10 +627,11 @@ class CrossAttnDownBlock2D(nn.Module):
                             return module(*inputs)
 
                     return custom_forward
-
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                    """
+                argsflatten, argsunflatten = cross_attn_get_args_flatten_unflatten(isinstance(encoder_hidden_states, tuple))
+                hidden_states = torch.utils.checkpoint.checkpoint(cross_attn_updown_create_custom_forward(resnet), hidden_states, temb)
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(attn, return_dict=False), hidden_states, encoder_hidden_states
+                    cross_attn_updown_create_custom_forward(attn, argsunflatten), *argsflatten(hidden_states, encoder_hidden_states, return_dict=False)
                 )[0]
             else:
                 hidden_states = resnet(hidden_states, temb)
@@ -644,6 +646,33 @@ class CrossAttnDownBlock2D(nn.Module):
             output_states += (hidden_states,)
 
         return hidden_states, output_states
+
+
+def cross_attn_get_args_flatten_unflatten(structureincluded):
+    def argsflatten(_hidden_states, _encoder_hidden_states, return_dict=False):
+        if structureincluded:
+            return _hidden_states, _encoder_hidden_states[0], _encoder_hidden_states[1], return_dict
+        else:
+            return _hidden_states, _encoder_hidden_states, return_dict
+
+    if structureincluded:
+        def argsunflatten(_hidden_states, _context, _structure, _return_dict):
+            return (_hidden_states, (_context, _structure)), {"return_dict": _return_dict}
+    else:
+        def argsunflatten(_hidden_states, _context, _return_dict):
+            return (_hidden_states, _context), {"return_dict": _return_dict}
+    return argsflatten, argsunflatten
+
+
+def cross_attn_updown_create_custom_forward(module, argsunflatten=None):
+    if argsunflatten is not None:
+        def custom_forward(*flattened_inputs):
+            args, kwargs = argsunflatten(*flattened_inputs)
+            return module(*args, **kwargs)
+    else:
+        def custom_forward(*inputs):
+            return module(*inputs)
+    return custom_forward
 
 
 class DownBlock2D(nn.Module):
@@ -1225,6 +1254,7 @@ class CrossAttnUpBlock2D(nn.Module):
 
             if self.training and self.gradient_checkpointing:
 
+                """
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
@@ -1233,10 +1263,11 @@ class CrossAttnUpBlock2D(nn.Module):
                             return module(*inputs)
 
                     return custom_forward
-
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                """
+                argsflatten, argsunflatten = cross_attn_get_args_flatten_unflatten(isinstance(encoder_hidden_states, tuple))
+                hidden_states = torch.utils.checkpoint.checkpoint(cross_attn_updown_create_custom_forward(resnet), hidden_states, temb)
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(attn, return_dict=False), hidden_states, encoder_hidden_states
+                    cross_attn_updown_create_custom_forward(attn, argsunflatten), *argsflatten(hidden_states, encoder_hidden_states, return_dict=False)
                 )[0]
             else:
                 hidden_states = resnet(hidden_states, temb)

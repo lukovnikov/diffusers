@@ -21,6 +21,7 @@ from diffusers.utils import is_accelerate_available
 from packaging import version
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
+from ... import StructuredUNet2DConditionModel
 from ...configuration_utils import FrozenDict
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...pipeline_utils import DiffusionPipeline
@@ -280,9 +281,11 @@ class StableDiffusionPipeline(DiffusionPipeline):
             return_tensors="pt",
         )
         text_input_ids = text_inputs.input_ids
+        maxlen = (text_input_ids != self.tokenizer.pad_token_id).long().sum(1).max().cpu().item()
+        text_input_ids = text_input_ids[:, :maxlen+1]
         untruncated_ids = self.tokenizer(prompt, padding="max_length", return_tensors="pt").input_ids
 
-        if not torch.equal(text_input_ids, untruncated_ids):
+        if text_input_ids.size(1) > untruncated_ids.size(1):
             removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
             logger.warning(
                 "The following part of your input was truncated because CLIP can only handle sequences up to"
@@ -304,6 +307,9 @@ class StableDiffusionPipeline(DiffusionPipeline):
         bs_embed, seq_len, _ = text_embeddings.shape
         text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
         text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        text_input_ids = text_input_ids[:, None, :].repeat(1, num_images_per_prompt, 1)
+        text_input_ids = text_input_ids.view(bs_embed * num_images_per_prompt, seq_len)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
@@ -334,6 +340,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 truncation=True,
                 return_tensors="pt",
             )
+            neg_input_ids = uncond_input.input_ids
 
             if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
                 attention_mask = uncond_input.attention_mask.to(device)
@@ -351,12 +358,16 @@ class StableDiffusionPipeline(DiffusionPipeline):
             uncond_embeddings = uncond_embeddings.repeat(1, num_images_per_prompt, 1)
             uncond_embeddings = uncond_embeddings.view(batch_size * num_images_per_prompt, seq_len, -1)
 
+            neg_input_ids = neg_input_ids[:, None, :].repeat(1, num_images_per_prompt, 1)
+            neg_input_ids = neg_input_ids.view(bs_embed * num_images_per_prompt, seq_len)
+
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_input_ids = torch.cat([neg_input_ids, text_input_ids])
 
-        return text_embeddings
+        return text_embeddings, text_input_ids
 
     def run_safety_checker(self, image, device, dtype):
         if self.safety_checker is not None:
@@ -513,7 +524,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
-        text_embeddings = self._encode_prompt(
+        text_embeddings, text_ids = self._encode_prompt(
             prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
@@ -546,7 +557,10 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+                if isinstance(self.unet, StructuredUNet2DConditionModel):
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=(text_embeddings, text_ids)).sample
+                else:
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:

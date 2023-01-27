@@ -1,8 +1,10 @@
 import argparse
 import hashlib
 import itertools
+import json
 import math
 import os
+import pathlib
 from pathlib import Path
 from typing import Optional
 import subprocess
@@ -15,8 +17,10 @@ from torch.utils.data import Dataset
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
-from diffusers.models.attention import BasicTransformerBlock
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel, StableDiffusionPipeline, \
+    DDIMScheduler
+from diffusers.models.attention import BasicTransformerBlock, CrossAttention
+from diffusers.models.customnn import StructuredCrossAttention, StructuredUNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
@@ -107,6 +111,13 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="The prompt with identifier specifying the instance",
+    )
+    parser.add_argument(
+        "--instance_type",
+        type=str,
+        default="thing",
+        required=False,
+        help="The type of instance (thing or person)",
     )
     parser.add_argument(
         "--class_prompt",
@@ -242,19 +253,31 @@ def parse_args(input_args=None):
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 
     parser.add_argument(
-        "--train_kv_emb_only", action="store_true", help="When enabled, only KV params of cross-attentions are trained, as well as the parameters of the special token(s)"
+        "--train_kv_emb_only", action="store_true", help="When enabled, only KV params of cross-attentions are trained, as well as the parameters of the special token(s). (~Custom Diffusion)"
+    )
+    parser.add_argument(
+        "--train_emb_only", action="store_true", help="When enabled, only parameters of the special token(s) embeddings are trained. (~Textual Inversion)"
+    )
+    parser.add_argument(
+        "--train_textenc_only", action="store_true", help="When enabled, only parameters of the text encoder are trained."
+    )
+    parser.add_argument(
+        "--train_emb_mem", action="store_true", help="When enabled, only parameters of the text encoder are trained."
     )
     parser.add_argument(
         "--finetune_token",
         type=str,
         default="hta sigue lun httr dits hmv",      # default collection
-        help="Which token to finetune when using '--train_kv_emb_only'."
+        help="Which token to finetune when using '--train_kv_emb_only'. "
+             "Also, the representations of these tokens are reset to vanilla."
     )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
+
+    assert sum([int(args.train_kv_emb_only), int(args.train_emb_only), int(args.train_textenc_only), int(args.train_emb_mem)]) <= 1
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -267,9 +290,9 @@ def parse_args(input_args=None):
             raise ValueError("You must specify prompt for class images.")
     else:
         if args.class_data_dir is not None:
-            logger.warning("You need not use --class_data_dir without --with_prior_preservation.")
+            logger.info("You need not use --class_data_dir without --with_prior_preservation.")
         if args.class_prompt is not None:
-            logger.warning("You need not use --class_prompt without --with_prior_preservation.")
+            logger.info("You need not use --class_prompt without --with_prior_preservation.")
 
     return args
 
@@ -416,6 +439,14 @@ def main(args):
                 safety_checker=None,
                 revision=args.revision,
             )
+            use_ddim = True
+            if use_ddim:
+                numsteps = 1000
+                print(f"Using DDIM with {numsteps} steps")
+                oldsched = pipeline.scheduler
+                pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
+                pipeline.scheduler.set_timesteps(numsteps)
+                assert torch.allclose(oldsched.alphas_cumprod, pipeline.scheduler.alphas_cumprod)
             pipeline.set_progress_bar_config(disable=True)
 
             num_new_images = args.num_class_images - cur_class_images
@@ -495,6 +526,26 @@ def main(args):
         revision=args.revision,
     )
 
+    if args.train_emb_mem:
+        # adapt unet to use StructuredCrossAttention
+        print("replacing CrossAttention in BasicTransformerBlock with StructuredCrossAttention")
+        _c = 0
+        for m in unet.modules():
+            if isinstance(m, BasicTransformerBlock):
+                m.attn2.__class__ = StructuredCrossAttention
+                if m.only_cross_attention:
+                    m.attn1.__class__ = StructuredCrossAttention
+                _c += 1
+        print(f"Replaced {_c} modules")
+        print("Replacing Unet with StructuredUnet and initializing mem")
+        unet.__class__ = StructuredUNet2DConditionModel
+        _c = 0
+        tokenid_to_mem_map = torch.zeros(text_encoder.text_model.embeddings.token_embedding.num_embeddings, dtype=torch.long)
+        for tokenid in tokenizer(args.finetune_token)["input_ids"][1:-1]:
+            tokenid_to_mem_map[tokenid] = _c + 1
+            _c += 1
+        unet.init_mem(tokenid_to_mem_map=tokenid_to_mem_map)
+
     vae.requires_grad_(False)
     if not args.train_text_encoder:
         text_encoder.requires_grad_(False)
@@ -529,8 +580,9 @@ def main(args):
     allparamstooptimize = list(params_to_optimize)
 
     if args.train_kv_emb_only:
+        print("optimizing kv and emb params only")
         # train token embeddings of text encoder --> we need to zero out all words except the finetuned one(s), if it's specified
-        params_to_optimize = [text_encoder.text_model.embeddings.token_embedding.weight]
+        params_to_optimize = []
         for submodule in unet.modules():
             if isinstance(submodule, BasicTransformerBlock):
                 # include cross attention
@@ -540,12 +592,39 @@ def main(args):
                 if submodule.only_cross_attention:
                     params_to_optimize += list(submodule.attn1.to_k.parameters())
                     params_to_optimize += list(submodule.attn1.to_v.parameters())
+
+    if args.train_emb_mem:
+        print("optimizing memory")
+        params_to_optimize = []
+        params_to_optimize.append(unet.mem)
+
+    if args.train_kv_emb_only or args.train_emb_only or args.train_emb_mem:
+        print("optimizing token embeddings")
+        if args.train_emb_only:
+            params_to_optimize = []
+        params_to_optimize.append(text_encoder.text_model.embeddings.token_embedding.weight)
         if args.finetune_token is not None:
+            print(f"optimizing token embeddings for '{args.finetune_token}' only")
             embedding_gradient_mask = torch.zeros_like(text_encoder.text_model.embeddings.token_embedding.weight[:, 0:1])
             tokenids = tokenizer.encode(args.finetune_token)[1:-1]
             for token in tokenids:
                 embedding_gradient_mask[token] = 1
             text_encoder.text_model.embeddings.token_embedding.register_buffer("gradmask", embedding_gradient_mask)
+
+    if args.finetune_token is not None:
+        replaceword = "custom"
+        print(f"Re-initializing token embeddings for '{args.finetune_token}' from '{replaceword}'.")
+        oldemb = text_encoder.text_model.embeddings.token_embedding
+        replaceword = tokenizer.encode(replaceword)[1]
+        replacevector = oldemb.weight.data[replaceword, :]
+        tokenids = tokenizer.encode(args.finetune_token)[1:-1]
+        for token in tokenids:
+            oldemb.weight.data[token, :] = replacevector
+
+    for param in allparamstooptimize:
+        param.requires_grad = False
+    for param in params_to_optimize:
+        param.requires_grad = True
 
     print(f"#Params to optimize: {count_parameters(list(params_to_optimize))//1e6:.1f}M/{count_parameters(list(allparamstooptimize))//1e6:.1f}M")
 
@@ -582,10 +661,14 @@ def main(args):
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
+        maxlen = max([len(x) for x in input_ids])
+        maxlen = min(maxlen, tokenizer.model_max_length)
+        # maxlen = tokenizer.model_max_length
+
         input_ids = tokenizer.pad(
             {"input_ids": input_ids},
             padding="max_length",
-            max_length=tokenizer.model_max_length,
+            max_length=maxlen,
             return_tensors="pt",
         ).input_ids
 
@@ -686,6 +769,8 @@ def main(args):
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                if args.train_emb_mem:
+                    encoder_hidden_states = (encoder_hidden_states, batch["input_ids"])
 
                 # Predict the noise residual
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -717,9 +802,12 @@ def main(args):
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
 
-                    if args.train_kv_emb_only and hasattr(text_encoder.text_model.embeddings.token_embedding, "gradmask"):
+                    text_model = text_encoder.module.text_model if isinstance(text_encoder,
+                                  torch.nn.parallel.DistributedDataParallel) else text_encoder.text_model
+                    if (args.train_kv_emb_only or args.train_emb_only) and hasattr(text_model.embeddings.token_embedding, "gradmask"):
                         # apply gradmask on embedding if train_kv_emb_only
-                        text_encoder.text_model.embeddings.token_embedding.weight.grad *= text_encoder.text_model.embeddings.token_embedding.gradmask
+                        text_model.embeddings.token_embedding.weight.grad \
+                            *= text_model.embeddings.token_embedding.gradmask
 
                     params_to_clip = (
                         itertools.chain(unet.parameters(), text_encoder.parameters())
@@ -738,24 +826,12 @@ def main(args):
 
                 if global_step % args.save_steps == 0:
                     if accelerator.is_main_process:
-                        pipeline = DiffusionPipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            unet=accelerator.unwrap_model(unet),
-                            text_encoder=accelerator.unwrap_model(text_encoder),
-                            revision=args.revision,
-                        )
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        pipeline.save_pretrained(save_path)
+                        save_model(unet, text_encoder, save_path, args, accelerator)
 
                 if args.generate_every > 0 and global_step % args.generate_every == 0:
                     if accelerator.is_main_process:
-                        pipeline = DiffusionPipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            unet=accelerator.unwrap_model(unet),
-                            text_encoder=accelerator.unwrap_model(text_encoder),
-                            revision=args.revision,
-                        )
-                        pipeline.save_pretrained(args.output_dir)
+                        save_model(unet, text_encoder, args.output_dir, args, accelerator)
                         print("generating")
                         # run generator script command
                         import subprocess
@@ -763,7 +839,8 @@ def main(args):
                                           "--outputdir", args.output_dir,
                                           "--step", str(global_step),
                                           "--concept", args.generate_concept,
-                                          "--conceptclass", args.generate_concept_class,])
+                                          "--conceptclass", args.generate_concept_class,
+                                          "--instancetype", args.instance_type])
                         subp.communicate()  # wait until generation script finishes
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -777,18 +854,67 @@ def main(args):
 
     # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
+        save_model(unet, text_encoder, args.output_dir, args, accelerator)
+        if args.push_to_hub:
+            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+
+    accelerator.end_training()
+
+
+def save_model(unet, text_encoder, path, args, accelerator):
+    # ensure path exists
+    Path(path).mkdir(parents=True, exist_ok=True)
+    saved = False
+    if args.train_emb_only or args.train_emb_mem:
+        savedict = {}
+        savedict["source"] = args.pretrained_model_name_or_path
+        savedict["replace"] = {}
+        print("Saving embeddings")
+        text_encoder = accelerator.unwrap_model(text_encoder)
+        savedict["replace"]["text_encoder"] = {
+                "text_model.embeddings.token_embedding.weight":
+                    text_encoder.text_model.embeddings.token_embedding.weight
+            }
+
+        if args.train_emb_only:
+            torch.save(savedict, os.path.join(path, "custom.pth"))
+            saved = True
+
+    if args.train_emb_mem:
+        savedict["unet-mem"] = unet.mem
+        savedict["unet-tokenid_to_mem_map"] = unet.tokenid_to_mem_map
+        savedict["convert"] = "structured"
+        torch.save(savedict, os.path.join(path, "custom.pth"))
+        saved = True
+
+    if saved is False:
+        print("Saving the entire model")
         pipeline = DiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             unet=accelerator.unwrap_model(unet),
             text_encoder=accelerator.unwrap_model(text_encoder),
             revision=args.revision,
         )
-        pipeline.save_pretrained(args.output_dir)
+        pipeline.save_pretrained(path)
 
-        if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
-    accelerator.end_training()
+def load_model(path, dtype=torch.float16):
+    if pathlib.Path(os.path.join(path, "custom.pth")).is_file():
+        d = torch.load(os.path.join(path, "custom.pth"))
+        pipe = StableDiffusionPipeline.from_pretrained(d["source"], torch_dtype=dtype)
+        for k in d["replace"]:
+            m = pipe
+            splits = k.split(".")
+            while len(splits) > 0:
+                head, *splits = splits
+                m = getattr(m, head)
+            if isinstance(m, torch.nn.Parameter):
+                m.data = d["replace"][k].data.to(dtype)
+            else:
+                raise NotImplementedError(f"Types other than torch.nn.Parameter not supported for replacing yet")
+    else:
+        pipe = StableDiffusionPipeline.from_pretrained(path, torch_dtype=torch.float16)
+    return pipe
 
 
 if __name__ == "__main__":

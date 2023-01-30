@@ -2,7 +2,8 @@ import os
 import pathlib
 
 import fire
-from diffusers import StableDiffusionPipeline, DDIMScheduler, StructuredUNet2DConditionModel
+from diffusers import StableDiffusionPipeline, DDIMScheduler, StructuredUNet2DConditionModel, \
+    DPMSolverMultistepScheduler
 import torch
 from PIL import Image
 import shelve
@@ -11,7 +12,7 @@ from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.customnn import StructuredCrossAttention
 
 
-def load_model(path, dtype=torch.float16, use_ddim=False):
+def load_model(path, dtype=torch.float16, use_ddim=False, use_dpm=False):
     if pathlib.Path(os.path.join(path, "custom.pth")).is_file():
         d = torch.load(os.path.join(path, "custom.pth"))
         pipe = StableDiffusionPipeline.from_pretrained(d["source"], torch_dtype=dtype)
@@ -44,6 +45,12 @@ def load_model(path, dtype=torch.float16, use_ddim=False):
         pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
         pipe.scheduler.set_timesteps(100)
         assert torch.allclose(oldsched.alphas_cumprod, pipe.scheduler.alphas_cumprod)
+
+    if use_dpm:
+        oldsched = pipe.scheduler
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        pipe.scheduler.set_timesteps(30)
+        assert torch.allclose(oldsched.alphas_cumprod, pipe.scheduler.alphas_cumprod)
     return pipe
 
 
@@ -71,11 +78,11 @@ def get_prompts(subject="the xvw dog", instancetype="thing"):
         ]
     elif instancetype == "portrait":
         prompts = [
-            f"a portrait photo of {subject}, 4k, highly detailed, realistic, olympus, fujifilm",
+            f"a portrait photo of {subject}, 4k, highly detailed, realistic, olympus, fujifilm, gigapixel, award-winning photography, instagram",
             f"a portrait photo of {subject} in front of the eifel tower, 4k, highly detailed, realistic, olympus, fujifilm",
-            f"a greek bust sculpture of {subject}, detailed, realistic, etsy, museum",
+            f"a cute portrait of {subject} in anime style, manga style, studio ghibli, 2D, cute, masterpiece",
             f"a dramatic oil portrait painting of {subject}, artistic, greg rutkowski, dramatic harsh light, 4k, trending on artstation",
-            f"an oil portrait painting of {subject} in the style of vincent van gogh",
+            # f"an oil portrait painting of {subject} in the style of vincent van gogh",
         ]
     return prompts
 
@@ -91,7 +98,7 @@ def main(outputdir:str="none",
     print(f"generation script called with args: {loc}")
     logfile.write(f"generation script called with args: {loc}")
     device = torch.device("cuda", gpu)
-    pipe = load_model(outputdir, use_ddim=False).to(device)  #StableDiffusionPipeline.from_pretrained(outputdir, torch_dtype=torch.float16).to(device)
+    pipe = load_model(outputdir, use_ddim=False, use_dpm=True).to(device)  #StableDiffusionPipeline.from_pretrained(outputdir, torch_dtype=torch.float16).to(device)
 
     prompts = get_prompts(concept, instancetype) + get_prompts(conceptclass, instancetype)
     print(f"prompts: {prompts}")
@@ -102,7 +109,7 @@ def main(outputdir:str="none",
         logfile.write(f"running prompt: {prompt}")
         generator = torch.Generator(device=device)
         generator.manual_seed(42)
-        images = pipe(prompt, num_inference_steps=50, guidance_scale=7.5, eta=0.,
+        images = pipe(prompt, num_inference_steps=32, guidance_scale=7.5, eta=0.,
                       generator=generator, num_images_per_prompt=imgperprompt, output_type="pil").images
         allimages.append(list(images))
         # imggrid = image_grid(images, 1, imgperprompt)

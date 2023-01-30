@@ -524,7 +524,7 @@ def main(args):
         args.pretrained_model_name_or_path,
         subfolder="unet",
         revision=args.revision,
-    )
+    ).to(torch.float32)
 
     if args.train_emb_mem:
         # adapt unet to use StructuredCrossAttention

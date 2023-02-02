@@ -21,7 +21,6 @@ from diffusers.utils import is_accelerate_available
 from packaging import version
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
-from ... import StructuredUNet2DConditionModel
 from ...configuration_utils import FrozenDict
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...pipeline_utils import DiffusionPipeline
@@ -308,9 +307,6 @@ class StableDiffusionPipeline(DiffusionPipeline):
         text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
         text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
-        text_input_ids = text_input_ids[:, None, :].repeat(1, num_images_per_prompt, 1)
-        text_input_ids = text_input_ids.view(bs_embed * num_images_per_prompt, seq_len)
-
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
             uncond_tokens: List[str]
@@ -340,7 +336,6 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 truncation=True,
                 return_tensors="pt",
             )
-            neg_input_ids = uncond_input.input_ids
 
             if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
                 attention_mask = uncond_input.attention_mask.to(device)
@@ -358,16 +353,12 @@ class StableDiffusionPipeline(DiffusionPipeline):
             uncond_embeddings = uncond_embeddings.repeat(1, num_images_per_prompt, 1)
             uncond_embeddings = uncond_embeddings.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-            neg_input_ids = neg_input_ids[:, None, :].repeat(1, num_images_per_prompt, 1)
-            neg_input_ids = neg_input_ids.view(bs_embed * num_images_per_prompt, seq_len)
-
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-            text_input_ids = torch.cat([neg_input_ids, text_input_ids])
 
-        return text_embeddings, text_input_ids
+        return text_embeddings
 
     def run_safety_checker(self, image, device, dtype):
         if self.safety_checker is not None:
@@ -524,7 +515,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
-        text_embeddings, text_ids = self._encode_prompt(
+        text_embeddings = self._encode_prompt(
             prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
@@ -539,7 +530,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             num_channels_latents,
             height,
             width,
-            text_embeddings.dtype,
+            text_embeddings.dtype if not isinstance(text_embeddings, tuple) else text_embeddings[0].dtype,
             device,
             generator,
             latents,
@@ -557,10 +548,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                if isinstance(self.unet, StructuredUNet2DConditionModel):
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=(text_embeddings, text_ids)).sample
-                else:
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:

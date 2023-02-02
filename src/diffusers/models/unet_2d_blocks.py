@@ -612,7 +612,7 @@ class CrossAttnDownBlock2D(nn.Module):
         for attn in self.attentions:
             attn._set_attention_slice(slice_size)
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, encoder_mask=None):
         output_states = ()
 
         for resnet, attn in zip(self.resnets, self.attentions):

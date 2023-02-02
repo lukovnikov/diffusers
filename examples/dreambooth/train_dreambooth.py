@@ -5,6 +5,7 @@ import json
 import math
 import os
 import pathlib
+from functools import partial
 from pathlib import Path
 from typing import Optional
 import subprocess
@@ -18,9 +19,10 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel, StableDiffusionPipeline, \
-    DDIMScheduler
+    DDIMScheduler, DPMSolverMultistepScheduler
 from diffusers.models.attention import BasicTransformerBlock, CrossAttention
-from diffusers.models.customnn import StructuredCrossAttention, StructuredUNet2DConditionModel
+from diffusers.models.customnn import StructuredCrossAttention, \
+    StructuredCLIPTextTransformer
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
@@ -106,7 +108,7 @@ def parse_args(input_args=None):
         help="A folder containing the training data of class images.",
     )
     parser.add_argument(
-        "--instance_prompt",
+        "--instance_prompts",
         type=str,
         default=None,
         required=True,
@@ -120,7 +122,7 @@ def parse_args(input_args=None):
         help="The type of instance (thing or person)",
     )
     parser.add_argument(
-        "--class_prompt",
+        "--class_prompts",
         type=str,
         default=None,
         help="The prompt to specify images in the same class as provided instance images.",
@@ -177,8 +179,8 @@ def parse_args(input_args=None):
     parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every X updates steps.")
     parser.add_argument("--generate_every", type=int, default=500, help="Generate images using script every X updates steps.")
     parser.add_argument("--generate_script", type=str, default="generate_during_train_script.py", help="Script to use to generate during training.")
-    parser.add_argument("--generate_concept", type=str, default="xvw", help="The name of the concept to be pasted into prompts from generation script.")
-    parser.add_argument("--generate_concept_class", type=str, default="xvw", help="The name of the concept class to be pasted into prompts from generation script.")
+    parser.add_argument("--generate_concept", type=str, default=None, help="The name of the concept to be pasted into prompts from generation script.")
+    parser.add_argument("--generate_concept_class", type=str, default=None, help="The name of the concept class to be pasted into prompts from generation script.")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -212,7 +214,7 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps", type=int, default=10, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
@@ -264,12 +266,19 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--train_emb_mem", action="store_true", help="When enabled, only parameters of the text encoder are trained."
     )
+
     parser.add_argument(
-        "--finetune_token",
+        "--initialize_extra_tokens",
         type=str,
-        default="hta sigue lun httr dits hmv",      # default collection
-        help="Which token to finetune when using '--train_kv_emb_only'. "
-             "Also, the representations of these tokens are reset to vanilla."
+        default=None,
+        help="Specification of which tokens are source extra tokens and how to initialize them. "
+             "Format example: '<sophia_winsell>=woman;<alvin_dog>=dog"
+    )
+    parser.add_argument(
+        "--num_vectors_per_extra_token",
+        type=int,
+        default=1,
+        help="Number of vectors to use for every new source extra token."
     )
 
     if input_args is not None:
@@ -286,12 +295,12 @@ def parse_args(input_args=None):
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
-        if args.class_prompt is None:
+        if args.class_prompts is None:
             raise ValueError("You must specify prompt for class images.")
     else:
         if args.class_data_dir is not None:
             logger.info("You need not use --class_data_dir without --with_prior_preservation.")
-        if args.class_prompt is not None:
+        if args.class_prompts is not None:
             logger.info("You need not use --class_prompt without --with_prior_preservation.")
 
     return args
@@ -300,16 +309,16 @@ def parse_args(input_args=None):
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
+    It pre-processes the images and tokenizes prompts.
     """
 
     def __init__(
         self,
         instance_data_root,
-        instance_prompt,
+        instance_prompts,
         tokenizer,
         class_data_root=None,
-        class_prompt=None,
+        class_prompts=None,
         size=512,
         center_crop=False,
     ):
@@ -323,16 +332,16 @@ class DreamBoothDataset(Dataset):
 
         self.instance_images_path = list(Path(instance_data_root).iterdir())
         self.num_instance_images = len(self.instance_images_path)
-        self.instance_prompt = instance_prompt
+        self.instance_prompts = instance_prompts if len(instance_prompts) > 1 else instance_prompts * self.num_instance_images
         self._length = self.num_instance_images
 
-        if class_data_root is not None:
+        if class_data_root is not None:     # TODO: number of class prompts etc
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
             self.class_images_path = list(self.class_data_root.iterdir())
             self.num_class_images = len(self.class_images_path)
             self._length = max(self.num_class_images, self.num_instance_images)
-            self.class_prompt = class_prompt
+            self.class_prompts = class_prompts if len(class_prompts) > 1 else class_prompts * self.num_class_images
         else:
             self.class_data_root = None
 
@@ -354,24 +363,33 @@ class DreamBoothDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
+
+        instance_prompt = self.instance_prompts[index % self.num_instance_images]
+        tokenized = self.tokenizer(
+            instance_prompt,
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
-        ).input_ids
+        )
+
+        example["instance_prompt_ids"] = tokenized.input_ids
+        example["instance_attention_mask"] = tokenized.attention_mask
 
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt_ids"] = self.tokenizer(
-                self.class_prompt,
+
+            class_prompt = self.class_prompts[index % self.num_class_images]
+            tokenized = self.tokenizer(
+                class_prompt,
                 padding="do_not_pad",
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
-            ).input_ids
+            )
+            example["class_prompt_ids"] = tokenized.input_ids
+            example["class_attention_mask"] = tokenized.attention_mask
 
         return example
 
@@ -401,6 +419,41 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{username}/{model_id}"
     else:
         return f"{organization}/{model_id}"
+
+
+
+def collate_fn(tokenizer, examples):
+    input_ids = [example["instance_prompt_ids"] for example in examples]
+    pixel_values = [example["instance_images"] for example in examples]
+    attention_masks = [example["instance_attention_mask"] for example in examples]
+
+    # Concat class and instance examples for prior preservation.
+    # We do this to avoid doing two forward passes.
+    if args.with_prior_preservation:
+        input_ids += [example["class_prompt_ids"] for example in examples]
+        pixel_values += [example["class_images"] for example in examples]
+        attention_masks += [example["class_attention_mask"] for example in examples]
+
+    pixel_values = torch.stack(pixel_values)
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+    maxlen = max([len(x) for x in input_ids])
+    maxlen = min(maxlen, tokenizer.model_max_length)
+    # maxlen = tokenizer.model_max_length
+
+    padded = tokenizer.pad(
+        {"input_ids": input_ids, "attention_mask": attention_masks},
+        padding="max_length",
+        max_length=maxlen,
+        return_tensors="pt",
+    )
+
+    batch = {
+        "input_ids": padded.input_ids,
+        "attention_mask": padded.attention_mask,
+        "pixel_values": pixel_values,
+    }
+    return batch
 
 
 def main(args):
@@ -439,41 +492,43 @@ def main(args):
                 safety_checker=None,
                 revision=args.revision,
             )
-            use_ddim = True
-            if use_ddim:
-                numsteps = 1000
-                print(f"Using DDIM with {numsteps} steps")
+            use_dpm = True
+            if use_dpm:
+                numsteps = 64
+                print(f"Using DPM with {numsteps} steps")
                 oldsched = pipeline.scheduler
-                pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
+                pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
                 pipeline.scheduler.set_timesteps(numsteps)
                 assert torch.allclose(oldsched.alphas_cumprod, pipeline.scheduler.alphas_cumprod)
             pipeline.set_progress_bar_config(disable=True)
 
             num_new_images = args.num_class_images - cur_class_images
             logger.info(f"Number of class images to sample: {num_new_images}.")
+            class_prompts = args.class_prompts.split(";")
+            i = 0
+            for class_prompt in class_prompts:
+                sample_dataset = PromptDataset(class_prompt, num_new_images // len(class_prompts))
+                sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
 
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
+                sample_dataloader = accelerator.prepare(sample_dataloader)
+                pipeline.to(accelerator.device)
 
-            sample_dataloader = accelerator.prepare(sample_dataloader)
-            pipeline.to(accelerator.device)
+                for example in tqdm(
+                    sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+                ):
+                    images = pipeline(example["prompt"]).images
 
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                images = pipeline(example["prompt"]).images
-
-                for i, image in enumerate(images):
-                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
+                    for _, image in enumerate(images):
+                        hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                        image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                        image.save(image_filename)
+                        i += 1
 
             del pipeline
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         else:
             logger.info("Using already sampled images.")
-
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
@@ -526,6 +581,40 @@ def main(args):
         revision=args.revision,
     ).to(torch.float32)
 
+
+    #### CUSTOM 3000 extra token, done for all methods just for coding convenience)
+    print(f"Adding 3000 extra tokens to tokenizer")
+    tokenizer.add_tokens([f"<extra-token-{i}>" for i in range(3000)])
+    tokenizervocab = tokenizer.get_vocab()
+
+    print(f"Extending token embedder with 3000 extra token vectors, randomly initialized")
+    embed = text_encoder.text_model.embeddings.token_embedding
+    extra_embed = torch.nn.Embedding(3000, embed.embedding_dim)
+    embed.weight.data = torch.cat([embed.weight.data, extra_embed.weight.data.to(embed.weight.dtype)])
+    embed.num_embeddings += 3000
+
+    print(f"Initializing extra tokens from spec")
+    extra_token_map = {}            # will be used during training to replace source special token with regular special tokens
+    extra_token_spec = {}
+    if args.initialize_extra_tokens is not None:  # "<sophia_winsell>=woman;<alvin_dog>=dog"
+        extra_token_inits = args.initialize_extra_tokens.split(";")
+        for extra_token_init in extra_token_inits:
+            sourcetoken, initword = extra_token_init.split("=")
+            extra_token_spec[sourcetoken] = initword
+            i = len(extra_token_map)
+            numvecs = args.num_vectors_per_extra_token
+            extra_token_map[sourcetoken] = [f"<extra-token-{i*numvecs+j}>" for j in range(numvecs)]
+            initword_id = tokenizer(initword)["input_ids"][1]
+            initword_vector = embed.weight.data[initword_id]
+            initword_vector = initword_vector + torch.randn_like(initword_vector) * initword_vector.std() * 0.1
+            for extra_token in extra_token_map[sourcetoken]:
+                embed.weight.data[tokenizervocab[extra_token], :] = initword_vector
+    if len(extra_token_spec) == 1:
+        generate_concept, generate_concept_class = list(extra_token_spec.items())[0]
+        print(f"Automatically inferred generate concept and class: {generate_concept}=>{generate_concept_class}")
+
+    extra_token_map_ids = {k: [tokenizervocab[vi] for vi in v] for k, v in extra_token_map.items()}     # only used in model saving --> save memory ids too
+
     if args.train_emb_mem:
         # adapt unet to use StructuredCrossAttention
         print("replacing CrossAttention in BasicTransformerBlock with StructuredCrossAttention")
@@ -537,14 +626,30 @@ def main(args):
                     m.attn1.__class__ = StructuredCrossAttention
                 _c += 1
         print(f"Replaced {_c} modules")
-        print("Replacing Unet with StructuredUnet and initializing mem")
-        unet.__class__ = StructuredUNet2DConditionModel
+        print("Replacing CLIP Encoder with Structured CLIP Encoder")
+        text_encoder.text_model.__class__ = StructuredCLIPTextTransformer
+
+        new_extra_token_map = {}
+        mem_token_map = {}
+        for source_extra_token, extra_tokens in extra_token_map.items():
+            new_extra_token_map[source_extra_token] = [extra_tokens[0]]
+            mem_token_map[extra_tokens[0]] = extra_tokens[1:]
+
+        extra_token_map = new_extra_token_map       # only used to replace text before running through model
+
+        # compute mem spec
+        supercellsize = len(list(mem_token_map.values())[0])
+        numsupercells = len(extra_token_map)
         _c = 0
-        tokenid_to_mem_map = torch.zeros(text_encoder.text_model.embeddings.token_embedding.num_embeddings, dtype=torch.long)
-        for tokenid in tokenizer(args.finetune_token)["input_ids"][1:-1]:
-            tokenid_to_mem_map[tokenid] = _c + 1
+        tokenid_to_mem_map = torch.zeros(embed.num_embeddings, dtype=torch.long)
+        mem_to_tokenid_map = torch.zeros(numsupercells, supercellsize, dtype=torch.long)
+        for source_extra_token, extra_tokens in extra_token_map.items():
+            tokenid_to_mem_map[tokenizervocab[extra_tokens[0]]] = _c + 1
+            mem_to_tokenid_map[_c, :] = torch.tensor([tokenizervocab[mem_token] for mem_token in mem_token_map[extra_tokens[0]]])
             _c += 1
-        unet.init_mem(tokenid_to_mem_map=tokenid_to_mem_map)
+        text_encoder.text_model.init_mem(tokenid_to_mem_map=tokenid_to_mem_map, mem_to_tokenid_map=mem_to_tokenid_map)
+
+    ####### END CUSTOM
 
     vae.requires_grad_(False)
     if not args.train_text_encoder:
@@ -579,47 +684,40 @@ def main(args):
     )
     allparamstooptimize = list(params_to_optimize)
 
-    if args.train_kv_emb_only:
-        print("optimizing kv and emb params only")
-        # train token embeddings of text encoder --> we need to zero out all words except the finetuned one(s), if it's specified
+    ####### CUSTOM #######
+    toreplace = set()      # parameter names which should be replaced in the base model when reloading finetuned model
+    if args.train_emb_only or args.train_emb_mem or args.train_kv_emb_only:
         params_to_optimize = []
-        for submodule in unet.modules():
+
+    if args.train_emb_only or args.train_emb_mem or args.train_kv_emb_only:
+        print("optimizing token embeddings")
+        params_to_optimize.append(text_encoder.text_model.embeddings.token_embedding.weight)
+        if args.initialize_extra_tokens:
+            print("Optimizing extra tokens only (last 3000 ids)")
+            embedding_gradient_mask = torch.zeros_like(
+                text_encoder.text_model.embeddings.token_embedding.weight[:, 0:1])
+            for tokenid in [tokenizervocab[f"<extra-token-{i}>"] for i in range(3000)]:
+                embedding_gradient_mask[tokenid] = 1
+            text_encoder.text_model.embeddings.token_embedding.register_buffer("gradmask", embedding_gradient_mask)
+
+    if args.train_kv_emb_only:
+        print("optimizing kv params")
+        # train token embeddings of text encoder --> we need to zero out all words except the finetuned one(s), if it's specified
+        for name, submodule in unet.named_modules():
             if isinstance(submodule, BasicTransformerBlock):
                 # include cross attention
                 params_to_optimize += list(submodule.attn2.to_k.parameters())
                 params_to_optimize += list(submodule.attn2.to_v.parameters())
+                toreplace.add(name + ".attn2.to_k")
+                toreplace.add(name + ".attn2.to_v")
                 # if transformer is purely cross attention, train other attn module too
                 if submodule.only_cross_attention:
                     params_to_optimize += list(submodule.attn1.to_k.parameters())
                     params_to_optimize += list(submodule.attn1.to_v.parameters())
+                    toreplace.add(name + ".attn1.to_k")
+                    toreplace.add(name + ".attn1.to_v")
 
-    if args.train_emb_mem:
-        print("optimizing memory")
-        params_to_optimize = []
-        params_to_optimize.append(unet.mem)
-
-    if args.train_kv_emb_only or args.train_emb_only or args.train_emb_mem:
-        print("optimizing token embeddings")
-        if args.train_emb_only:
-            params_to_optimize = []
-        params_to_optimize.append(text_encoder.text_model.embeddings.token_embedding.weight)
-        if args.finetune_token is not None:
-            print(f"optimizing token embeddings for '{args.finetune_token}' only")
-            embedding_gradient_mask = torch.zeros_like(text_encoder.text_model.embeddings.token_embedding.weight[:, 0:1])
-            tokenids = tokenizer.encode(args.finetune_token)[1:-1]
-            for token in tokenids:
-                embedding_gradient_mask[token] = 1
-            text_encoder.text_model.embeddings.token_embedding.register_buffer("gradmask", embedding_gradient_mask)
-
-    if args.finetune_token is not None:
-        replaceword = "custom"
-        print(f"Re-initializing token embeddings for '{args.finetune_token}' from '{replaceword}'.")
-        oldemb = text_encoder.text_model.embeddings.token_embedding
-        replaceword = tokenizer.encode(replaceword)[1]
-        replacevector = oldemb.weight.data[replaceword, :]
-        tokenids = tokenizer.encode(args.finetune_token)[1:-1]
-        for token in tokenids:
-            oldemb.weight.data[token, :] = replacevector
+    ####### END CUSTOM
 
     for param in allparamstooptimize:
         param.requires_grad = False
@@ -638,48 +736,25 @@ def main(args):
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
+
+    instance_prompts = args.instance_prompts
+    for k, v in extra_token_map.items():
+        instance_prompts = instance_prompts.replace(k, " ".join(v))
+    instance_prompts = instance_prompts.split(";")
+    class_prompts = args.class_prompts.split(";")
+
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
+        instance_prompts=instance_prompts,
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
+        class_prompts=class_prompts,
         tokenizer=tokenizer,
         size=args.resolution,
         center_crop=args.center_crop,
     )
 
-    def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-        maxlen = max([len(x) for x in input_ids])
-        maxlen = min(maxlen, tokenizer.model_max_length)
-        # maxlen = tokenizer.model_max_length
-
-        input_ids = tokenizer.pad(
-            {"input_ids": input_ids},
-            padding="max_length",
-            max_length=maxlen,
-            return_tensors="pt",
-        ).input_ids
-
-        batch = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-        }
-        return batch
-
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, num_workers=1
+        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=partial(collate_fn, tokenizer), num_workers=1
     )
 
     # Scheduler and math around the number of training steps.
@@ -768,12 +843,10 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                if args.train_emb_mem:
-                    encoder_hidden_states = (encoder_hidden_states, batch["input_ids"])
+                encoder_hidden_states = text_encoder(batch["input_ids"], attention_mask=batch["attention_mask"])[0]
 
                 # Predict the noise residual
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, encoder_mask=batch["attention_mask"]).sample
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -827,19 +900,19 @@ def main(args):
                 if global_step % args.save_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        save_model(unet, text_encoder, save_path, args, accelerator)
+                        save_model(unet, text_encoder, save_path, args, accelerator, extra_token_map_ids)
 
                 if args.generate_every > 0 and global_step % args.generate_every == 0:
                     if accelerator.is_main_process:
-                        save_model(unet, text_encoder, args.output_dir, args, accelerator)
+                        save_model(unet, text_encoder, args.output_dir, args, accelerator, extra_token_map_ids)
                         print("generating")
                         # run generator script command
                         import subprocess
                         subp = subprocess.Popen(["python", args.generate_script,
                                           "--outputdir", args.output_dir,
                                           "--step", str(global_step),
-                                          "--concept", args.generate_concept,
-                                          "--conceptclass", args.generate_concept_class,
+                                          "--concept", generate_concept,
+                                          "--conceptclass", generate_concept_class,
                                           "--instancetype", args.instance_type])
                         subp.communicate()  # wait until generation script finishes
 
@@ -854,38 +927,66 @@ def main(args):
 
     # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
-        save_model(unet, text_encoder, args.output_dir, args, accelerator)
+        save_model(unet, text_encoder, args.output_dir, args, accelerator, extra_token_map_ids)
         if args.push_to_hub:
             repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
     accelerator.end_training()
 
 
-def save_model(unet, text_encoder, path, args, accelerator):
+def save_model(unet, text_encoder, path, args, accelerator, extra_token_map):
     # ensure path exists
     Path(path).mkdir(parents=True, exist_ok=True)
     saved = False
-    if args.train_emb_only or args.train_emb_mem:
+    if args.train_emb_only or args.train_emb_mem or args.train_kv_emb_only:
         savedict = {}
         savedict["source"] = args.pretrained_model_name_or_path
-        savedict["replace"] = {}
-        print("Saving embeddings")
+        print("Extracting and saving embeddings")
         text_encoder = accelerator.unwrap_model(text_encoder)
-        savedict["replace"]["text_encoder"] = {
-                "text_model.embeddings.token_embedding.weight":
-                    text_encoder.text_model.embeddings.token_embedding.weight
-            }
+        embed = text_encoder.text_model.embeddings.token_embedding
+        vectors = {}
+        for source_extra_token, extra_token_list in extra_token_map.items():
+            vectors[source_extra_token] = [embed.weight.data[extra_token_id, :].cpu().detach() for extra_token_id in extra_token_list]
+        savedict["custom_embeddings"] = vectors
 
-        if args.train_emb_only:
+        if args.train_emb_mem:
+            savedict["use_mem"] = True
+
+        if args.train_emb_only or args.train_emb_mem:
             torch.save(savedict, os.path.join(path, "custom.pth"))
             saved = True
 
-    if args.train_emb_mem:
-        savedict["unet-mem"] = unet.mem
-        savedict["unet-tokenid_to_mem_map"] = unet.tokenid_to_mem_map
-        savedict["convert"] = "structured"
+    if args.train_kv_emb_only:
+        print(f"Saving key-value projections from cross-attention in Unet.")
+        toreplace = set()  # parameter names which should be replaced in the base model when reloading finetuned model
+        unet = accelerator.unwrap_model(unet)
+        for name, submodule in unet.named_modules():
+            if isinstance(submodule, BasicTransformerBlock):
+                # include cross attention
+                toreplace.add(name + ".attn2.to_k")
+                toreplace.add(name + ".attn2.to_v")
+                # if transformer is purely cross attention, train other attn module too
+                if submodule.only_cross_attention:
+                    toreplace.add(name + ".attn1.to_k")
+                    toreplace.add(name + ".attn1.to_v")
+        pruned_dict = {}
+        for k, v in unet.state_dict().items():
+            for repl_prefix in toreplace:
+                if k.startswith(repl_prefix):
+                    pruned_dict[k] = v
+                    break
+        print(f"Saving {len(pruned_dict)} elements from unet state_dict")
+        savedict["unet_state_dict"] = pruned_dict
+
         torch.save(savedict, os.path.join(path, "custom.pth"))
         saved = True
+
+    # if args.train_emb_mem:
+    #     savedict["unet-mem"] = unet.mem
+    #     savedict["unet-tokenid_to_mem_map"] = unet.tokenid_to_mem_map
+    #     savedict["convert"] = "structured"
+    #     torch.save(savedict, os.path.join(path, "custom.pth"))
+    #     saved = True
 
     if saved is False:
         print("Saving the entire model")

@@ -1,12 +1,16 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List, Callable
 
 import torch
 from torch import nn
+from transformers import CLIPTextConfig
+from transformers.models.clip.modeling_clip import CLIPTextTransformer
 
 from diffusers.models.attention import CrossAttention
 from .unet_2d_condition import UNet2DConditionOutput
 from .. import UNet2DConditionModel
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
 from ..configuration_utils import register_to_config
+from ..pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from ..utils.import_utils import is_xformers_available
 from ..utils import logging
 
@@ -133,158 +137,168 @@ class StructuredCrossAttention(CrossAttention):
             return hidden_states
 
 
-class StructuredUNet2DConditionModel(UNet2DConditionModel):
+class StructuredCLIPTextTransformer(CLIPTextTransformer):
 
     def init_mem(self,
-        nummem: int = 2,
-        memsize: int = 32,
-        memdim: int = 768,
-        mem = None,
-        tokenid_to_mem_map = None):
-        if mem is None:
-            mem = torch.nn.Linear(nummem * memsize, memdim)
-            mem = mem.weight.T.view(nummem, memsize, memdim)
-        self.mem = torch.nn.Parameter(mem)
+        tokenid_to_mem_map = None,
+        mem_to_tokenid_map = None):
         self.register_buffer("tokenid_to_mem_map", tokenid_to_mem_map)
+        self.register_buffer("mem_to_tokenid_map", mem_to_tokenid_map)
 
     def forward(
         self,
-        sample: torch.FloatTensor,
-        timestep: Union[torch.Tensor, float, int],
-        encoder_hidden_states: Tuple[torch.Tensor, torch.Tensor],
-        class_labels: Optional[torch.Tensor] = None,
-        return_dict: bool = True,
-    ) -> Union[UNet2DConditionOutput, Tuple]:
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        ret = super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+        if return_dict:
+            text_embeds = ret.last_hidden_state
+        else:
+            text_embeds, *_ret = ret
+
+        # prepend the memory token embeddings raw in text embeds
+        # compute mem ids: concatenate all memory token ids after each other and repeat across all examples
+        mem_to_tokenid_map = self.mem_to_tokenid_map
+        numsupercell, supercellsize = mem_to_tokenid_map.shape
+        batsize = input_ids.size(0)
+        mem_ids = mem_to_tokenid_map.view(-1)[None, :].repeat(batsize, 1)
+        # (batsize, nummemids * nummem,)
+
+        # embed mem ids without positioning and concatenate
+        mem_embeds = self.embeddings.token_embedding(mem_ids)       # (batsize, nummemids * nummem, embdim)
+        embeds = torch.cat([mem_embeds, text_embeds], 1)
+
+        # compute structure spec
+        structure = self.tokenid_to_mem_map[input_ids]
+        structure = torch.cat([torch.zeros_like(structure[:, 0:1]).repeat(1, numsupercell*supercellsize), structure], 1)
+        structure[:, 0] = numsupercell
+        structure[:, 1] = supercellsize
+        if return_dict:
+            ret.last_hidden_state = (embeds, structure)
+        else:
+            ret = ((embeds, structure)) + _ret
+        return ret
+
+
+class StructuredStableDiffusionPipeline(StableDiffusionPipeline):
+    ###### THE CHANGE: output text embeddings AND text structure in encode prompt --> it gets passed on into Unet straight away in superclass
+
+    def _encode_prompt(self, prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt):
         r"""
+        Encodes the prompt into text encoder hidden states.
+
         Args:
-            sample (`torch.FloatTensor`): (batch, channel, height, width) noisy inputs tensor
-            timestep (`torch.FloatTensor` or `float` or `int`): (batch) timesteps
-            encoder_hidden_states (`torch.FloatTensor`): (batch, channel, height, width) encoder hidden states
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.unet_2d_condition.UNet2DConditionOutput`] or `tuple`:
-            [`~models.unet_2d_condition.UNet2DConditionOutput`] if `return_dict` is True, otherwise a `tuple`. When
-            returning a tuple, the first element is the sample tensor.
+            prompt (`str` or `list(int)`):
+                prompt to be encoded
+            device: (`torch.device`):
+                torch device
+            num_images_per_prompt (`int`):
+                number of images that should be generated per prompt
+            do_classifier_free_guidance (`bool`):
+                whether to use classifier free guidance or not
+            negative_prompt (`str` or `List[str]`):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
         """
+        batch_size = len(prompt) if isinstance(prompt, list) else 1
 
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        maxlen = (text_input_ids != self.tokenizer.pad_token_id).long().sum(1).max().cpu().item()
+        text_input_ids = text_input_ids[:, :maxlen+1]
+        untruncated_ids = self.tokenizer(prompt, padding="max_length", return_tensors="pt").input_ids
 
-        nummem, memsize, memdim = self.mem.shape
-        mem = self.mem.view(-1, self.mem.size(-1))[None, :, :].repeat(sample.size(0), 1, 1)
-        encoder_hidden_states, inputids = encoder_hidden_states
-        structure = self.tokenid_to_mem_map[inputids]
-        # print(mem.size(), encoder_hidden_states.size())
-        encoder_hidden_states = torch.cat([mem, encoder_hidden_states], 1)
-        structure = torch.cat([torch.zeros_like(structure[:, 0:1]).repeat(1, nummem*memsize), structure], 1)
-        structure[:, 0] = nummem
-        structure[:, 1] = memsize
+        if text_input_ids.size(1) > untruncated_ids.size(1):
+            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
+            logger.warning(
+                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+            )
 
-        # encoder_hidden_states = (encoder_hidden_states, structure)
+        if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+            attention_mask = text_inputs.attention_mask.to(device)
+        else:
+            attention_mask = None
 
-        return super().forward(sample, timestep, (encoder_hidden_states, structure), class_labels, return_dict)
-        ###############################
+        text_embeddings = self.text_encoder(
+            text_input_ids.to(device),
+            attention_mask=attention_mask,
+        )
+        text_embeddings, text_structure, *_ = text_embeddings
 
-        # By default samples have to be AT least a multiple of the overall upsampling factor.
-        # The overall upsampling factor is equal to 2 ** (# num of upsampling layears).
-        # However, the upsampling interpolation output size can be forced to fit any upsampling size
-        # on the fly if necessary.
-        default_overall_up_factor = 2**self.num_upsamplers
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        bs_embed, seq_len, _ = text_embeddings.shape
+        text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
+        text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
-        # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
-        forward_upsample_size = False
-        upsample_size = None
-
-        if any(s % default_overall_up_factor != 0 for s in sample.shape[-2:]):
-            logger.info("Forward upsample size to force interpolation output size.")
-            forward_upsample_size = True
-
-        # 0. center input if necessary
-        if self.config.center_input_sample:
-            sample = 2 * sample - 1.0
-
-        # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
-            is_mps = sample.device.type == "mps"
-            if isinstance(timestep, float):
-                dtype = torch.float32 if is_mps else torch.float64
-            else:
-                dtype = torch.int32 if is_mps else torch.int64
-            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
-        elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-
-        t_emb = self.time_proj(timesteps)
-
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=self.dtype)
-        emb = self.time_embedding(t_emb)
-
-        if self.config.num_class_embeds is not None:
-            if class_labels is None:
-                raise ValueError("class_labels should be provided when num_class_embeds > 0")
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
-            emb = emb + class_emb
-
-        # 2. pre-process
-        sample = self.conv_in(sample)
-
-        # 3. down
-        down_block_res_samples = (sample,)
-        for downsample_block in self.down_blocks:
-            if hasattr(downsample_block, "attentions") and downsample_block.attentions is not None:
-                sample, res_samples = downsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states,
+        # get unconditional embeddings for classifier free guidance
+        if do_classifier_free_guidance:
+            uncond_tokens: List[str]
+            if negative_prompt is None:
+                uncond_tokens = [""] * batch_size
+            elif type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            elif isinstance(negative_prompt, str):
+                uncond_tokens = [negative_prompt]
+            elif batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                    " the batch size of `prompt`."
                 )
             else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+                uncond_tokens = negative_prompt
 
-            down_block_res_samples += res_samples
+            max_length = text_input_ids.shape[-1]
+            uncond_input = self.tokenizer(
+                uncond_tokens,
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            neg_input_ids = uncond_input.input_ids
 
-        # 4. mid
-        sample = self.mid_block(sample, emb, encoder_hidden_states=encoder_hidden_states)
-
-        # 5. up
-        for i, upsample_block in enumerate(self.up_blocks):
-            is_final_block = i == len(self.up_blocks) - 1
-
-            res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
-            down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
-
-            # if we have not reached the final block and need to forward the
-            # upsample size, we do it here
-            if not is_final_block and forward_upsample_size:
-                upsample_size = down_block_res_samples[-1].shape[2:]
-
-            if hasattr(upsample_block, "attentions") and upsample_block.attentions is not None:
-                sample = upsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    res_hidden_states_tuple=res_samples,
-                    encoder_hidden_states=encoder_hidden_states,
-                    upsample_size=upsample_size,
-                )
+            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                attention_mask = uncond_input.attention_mask.to(device)
             else:
-                sample = upsample_block(
-                    hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size
-                )
-        # 6. post-process
-        sample = self.conv_norm_out(sample)
-        sample = self.conv_act(sample)
-        sample = self.conv_out(sample)
+                attention_mask = None
 
-        if not return_dict:
-            return (sample,)
+            uncond_embeddings = self.text_encoder(
+                uncond_input.input_ids.to(device),
+                attention_mask=attention_mask,
+            )
+            uncond_embeddings, uncond_structure, *_ = uncond_embeddings
 
-        return UNet2DConditionOutput(sample=sample)
+            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+            seq_len = uncond_embeddings.shape[1]
+            uncond_embeddings = uncond_embeddings.repeat(1, num_images_per_prompt, 1)
+            uncond_embeddings = uncond_embeddings.view(batch_size * num_images_per_prompt, seq_len, -1)
 
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_structure = torch.cat([uncond_structure, text_structure])
+
+        return text_embeddings, text_structure

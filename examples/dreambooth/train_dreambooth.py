@@ -606,9 +606,11 @@ def main(args):
             extra_token_map[sourcetoken] = [f"<extra-token-{i*numvecs+j}>" for j in range(numvecs)]
             initword_id = tokenizer(initword)["input_ids"][1]
             initword_vector = embed.weight.data[initword_id]
-            initword_vector = initword_vector + torch.randn_like(initword_vector) * initword_vector.std() * 0.1
-            for extra_token in extra_token_map[sourcetoken]:
-                embed.weight.data[tokenizervocab[extra_token], :] = initword_vector
+            for j, extra_token in enumerate(extra_token_map[sourcetoken]):
+                randfactor = (1. if j > 0 else 0.) if args.train_emb_mem else 0.5
+                _initword_vector = initword_vector + torch.randn_like(initword_vector) * initword_vector.std() * randfactor
+                # _initword_vector = torch.randn_like(initword_vector) * initword_vector.std()
+                embed.weight.data[tokenizervocab[extra_token], :] = _initword_vector
     if len(extra_token_spec) == 1:
         generate_concept, generate_concept_class = list(extra_token_spec.items())[0]
         print(f"Automatically inferred generate concept and class: {generate_concept}=>{generate_concept_class}")
@@ -691,14 +693,14 @@ def main(args):
 
     if args.train_emb_only or args.train_emb_mem or args.train_kv_emb_only:
         print("optimizing token embeddings")
-        params_to_optimize.append(text_encoder.text_model.embeddings.token_embedding.weight)
+        params_to_optimize.append(embed.weight)
         if args.initialize_extra_tokens:
             print("Optimizing extra tokens only (last 3000 ids)")
             embedding_gradient_mask = torch.zeros_like(
-                text_encoder.text_model.embeddings.token_embedding.weight[:, 0:1])
+                embed.weight[:, 0:1])
             for tokenid in [tokenizervocab[f"<extra-token-{i}>"] for i in range(3000)]:
                 embedding_gradient_mask[tokenid] = 1
-            text_encoder.text_model.embeddings.token_embedding.register_buffer("gradmask", embedding_gradient_mask)
+            embed.register_buffer("gradmask", embedding_gradient_mask)
 
     if args.train_kv_emb_only:
         print("optimizing kv params")
@@ -877,8 +879,8 @@ def main(args):
 
                     text_model = text_encoder.module.text_model if isinstance(text_encoder,
                                   torch.nn.parallel.DistributedDataParallel) else text_encoder.text_model
-                    if (args.train_kv_emb_only or args.train_emb_only) and hasattr(text_model.embeddings.token_embedding, "gradmask"):
-                        # apply gradmask on embedding if train_kv_emb_only
+                    if (args.train_kv_emb_only or args.train_emb_only or args.train_emb_mem) and hasattr(text_model.embeddings.token_embedding, "gradmask"):
+                        # apply gradmask on embedding
                         text_model.embeddings.token_embedding.weight.grad \
                             *= text_model.embeddings.token_embedding.gradmask
 

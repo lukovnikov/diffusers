@@ -41,6 +41,7 @@ class StructuredCrossAttention(CrossAttention):
 
     def forward(self, hidden_states, context=None, mask=None):
         context, structure = context if isinstance(context, tuple) else (context, None)
+        # structure = None        # DEBUG TODO: remove this line
         batch_size, sequence_length, _ = hidden_states.shape
 
         query = self.to_q(hidden_states)
@@ -139,9 +140,7 @@ class StructuredCrossAttention(CrossAttention):
 
 class StructuredCLIPTextTransformer(CLIPTextTransformer):
 
-    def init_mem(self,
-        tokenid_to_mem_map = None,
-        mem_to_tokenid_map = None):
+    def init_mem(self, tokenid_to_mem_map = None, mem_to_tokenid_map = None):
         self.register_buffer("tokenid_to_mem_map", tokenid_to_mem_map)
         self.register_buffer("mem_to_tokenid_map", mem_to_tokenid_map)
 
@@ -162,6 +161,7 @@ class StructuredCLIPTextTransformer(CLIPTextTransformer):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
+
         if return_dict:
             text_embeds = ret.last_hidden_state
         else:
@@ -177,6 +177,7 @@ class StructuredCLIPTextTransformer(CLIPTextTransformer):
 
         # embed mem ids without positioning and concatenate
         mem_embeds = self.embeddings.token_embedding(mem_ids)       # (batsize, nummemids * nummem, embdim)
+        # mem_embeds = torch.zeros_like(mem_embeds)       # DEBUG TODO: remove this line
         embeds = torch.cat([mem_embeds, text_embeds], 1)
 
         # compute structure spec
@@ -184,6 +185,7 @@ class StructuredCLIPTextTransformer(CLIPTextTransformer):
         structure = torch.cat([torch.zeros_like(structure[:, 0:1]).repeat(1, numsupercell*supercellsize), structure], 1)
         structure[:, 0] = numsupercell
         structure[:, 1] = supercellsize
+
         if return_dict:
             ret.last_hidden_state = (embeds, structure)
         else:
@@ -241,12 +243,14 @@ class StructuredStableDiffusionPipeline(StableDiffusionPipeline):
             text_input_ids.to(device),
             attention_mask=attention_mask,
         )
-        text_embeddings, text_structure, *_ = text_embeddings
+        text_embeddings, text_structure = text_embeddings[0]
 
         # duplicate text embeddings for each generation per prompt, using mps friendly method
         bs_embed, seq_len, _ = text_embeddings.shape
-        text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
+        text_embeddings = text_embeddings[:, None, :, :].repeat(1, num_images_per_prompt, 1, 1)
         text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        text_structure = text_structure[:, None, :].repeat(1, num_images_per_prompt, 1)
+        text_structure = text_structure.view(bs_embed * num_images_per_prompt, seq_len)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
@@ -277,7 +281,7 @@ class StructuredStableDiffusionPipeline(StableDiffusionPipeline):
                 truncation=True,
                 return_tensors="pt",
             )
-            neg_input_ids = uncond_input.input_ids
+
 
             if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
                 attention_mask = uncond_input.attention_mask.to(device)
@@ -288,12 +292,14 @@ class StructuredStableDiffusionPipeline(StableDiffusionPipeline):
                 uncond_input.input_ids.to(device),
                 attention_mask=attention_mask,
             )
-            uncond_embeddings, uncond_structure, *_ = uncond_embeddings
+            uncond_embeddings, uncond_structure = uncond_embeddings[0]
 
             # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
             seq_len = uncond_embeddings.shape[1]
-            uncond_embeddings = uncond_embeddings.repeat(1, num_images_per_prompt, 1)
+            uncond_embeddings = uncond_embeddings[:, None, :, :].repeat(1, num_images_per_prompt, 1, 1)
             uncond_embeddings = uncond_embeddings.view(batch_size * num_images_per_prompt, seq_len, -1)
+            uncond_structure = uncond_structure[:, None, :].repeat(1, num_images_per_prompt, 1)
+            uncond_structure = uncond_structure.view(bs_embed * num_images_per_prompt, seq_len)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch

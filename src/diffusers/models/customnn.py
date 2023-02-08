@@ -3,7 +3,8 @@ from typing import Optional, Tuple, Union, List, Callable
 import torch
 from torch import nn
 from transformers import CLIPTextConfig
-from transformers.models.clip.modeling_clip import CLIPTextTransformer
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.models.clip.modeling_clip import CLIPTextTransformer, _expand_mask
 
 from diffusers.models.attention import CrossAttention
 from .unet_2d_condition import UNet2DConditionOutput
@@ -23,6 +24,9 @@ else:
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+USE_SIMPLE_MEM = True
+DEBUG = False
+
 
 class StructuredCrossAttention(CrossAttention):
     r"""
@@ -41,7 +45,8 @@ class StructuredCrossAttention(CrossAttention):
 
     def forward(self, hidden_states, context=None, mask=None):
         context, structure = context if isinstance(context, tuple) else (context, None)
-        # structure = None        # DEBUG TODO: remove this line
+        if USE_SIMPLE_MEM or DEBUG:
+            structure = None
         batch_size, sequence_length, _ = hidden_states.shape
 
         query = self.to_q(hidden_states)
@@ -144,6 +149,102 @@ class StructuredCLIPTextTransformer(CLIPTextTransformer):
         self.register_buffer("tokenid_to_mem_map", tokenid_to_mem_map)
         self.register_buffer("mem_to_tokenid_map", mem_to_tokenid_map)
 
+    def simple_forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        r"""
+        Returns:
+
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is None:
+            raise ValueError("You have to specify either input_ids")
+
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_shape[-1])
+
+        # throw in the memory outside the position encodings
+        mem_to_tokenid_map = self.mem_to_tokenid_map
+        numsupercell, supercellsize = mem_to_tokenid_map.shape
+
+        # prepend the memory token embeddings raw in text embeds
+        # compute mem ids: concatenate all memory token ids after each other and repeat across all examples
+        batsize = input_ids.size(0)
+        mem_ids = mem_to_tokenid_map.view(-1)[None, :].repeat(batsize, 1)
+        # (batsize, nummemids * nummem,)
+
+        # embed mem ids without positioning and concatenate
+        mem_embeds = self.embeddings.token_embedding(mem_ids)       # (batsize, nummemids * nummem, embdim)
+
+        hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
+        # print(mem_embeds.shape, hidden_states.shape, mem_ids)
+        hidden_states = torch.cat([mem_embeds, hidden_states], 1)
+
+        if attention_mask is not None:
+            attention_mask = torch.cat([torch.ones_like(mem_ids).to(attention_mask.dtype), attention_mask], 1)
+
+        # print(attention_mask)
+
+        bsz, seq_len, _ = hidden_states.shape
+        # CLIP's text model uses causal mask, prepare it here.
+        # https://github.com/openai/CLIP/blob/cfcffb90e69f37bf2ff1e988237a0fbe41f33c04/clip/model.py#L324
+        causal_attention_mask = self._build_causal_attention_mask(bsz, seq_len, hidden_states.dtype).to(
+            hidden_states.device
+        )
+        # expand attention_mask
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            attention_mask = _expand_mask(attention_mask, hidden_states.dtype)
+
+        encoder_outputs = self.encoder(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            causal_attention_mask=causal_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        last_hidden_state = encoder_outputs[0]
+        last_hidden_state = self.final_layer_norm(last_hidden_state)
+
+        # text_embeds.shape = [batch_size, sequence_length, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+        pooled_output = last_hidden_state[
+            torch.arange(last_hidden_state.shape[0], device=input_ids.device), input_ids.to(torch.int).argmax(dim=-1)
+        ]
+
+        # compute structure spec
+        structure = self.tokenid_to_mem_map[input_ids]
+        structure = torch.cat([torch.zeros_like(structure[:, 0:1]).repeat(1, numsupercell*supercellsize), structure], 1)
+        structure[:, 0] = numsupercell
+        structure[:, 1] = supercellsize
+        # print(last_hidden_state.shape, structure.shape)
+        # print(structure)
+        last_hidden_state = (last_hidden_state, structure)
+
+        if not return_dict:
+            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=pooled_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -153,6 +254,15 @@ class StructuredCLIPTextTransformer(CLIPTextTransformer):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ):
+        if USE_SIMPLE_MEM:
+            return self.simple_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict)
+
         ret = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -167,10 +277,12 @@ class StructuredCLIPTextTransformer(CLIPTextTransformer):
         else:
             text_embeds, *_ret = ret
 
-        # prepend the memory token embeddings raw in text embeds
-        # compute mem ids: concatenate all memory token ids after each other and repeat across all examples
         mem_to_tokenid_map = self.mem_to_tokenid_map
         numsupercell, supercellsize = mem_to_tokenid_map.shape
+
+        # prepend the memory token embeddings raw in text embeds
+        # compute mem ids: concatenate all memory token ids after each other and repeat across all examples
+
         batsize = input_ids.size(0)
         mem_ids = mem_to_tokenid_map.view(-1)[None, :].repeat(batsize, 1)
         # (batsize, nummemids * nummem,)

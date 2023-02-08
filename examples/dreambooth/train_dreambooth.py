@@ -607,7 +607,7 @@ def main(args):
             initword_id = tokenizer(initword)["input_ids"][1]
             initword_vector = embed.weight.data[initword_id]
             for j, extra_token in enumerate(extra_token_map[sourcetoken]):
-                randfactor = (1. if j > 0 else 0.) if args.train_emb_mem else 0.5
+                randfactor = (.5 if j > 0 else 0.) if args.train_emb_mem else 0.5
                 _initword_vector = initword_vector + torch.randn_like(initword_vector) * initword_vector.std() * randfactor
                 # _initword_vector = torch.randn_like(initword_vector) * initword_vector.std()
                 embed.weight.data[tokenizervocab[extra_token], :] = _initword_vector

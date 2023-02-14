@@ -10,6 +10,8 @@ import shelve
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.customnn import StructuredCrossAttention, StructuredCLIPTextTransformer, \
     StructuredStableDiffusionPipeline
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_layers2img import \
+    StableDiffusionPipelineLayers2ImageV1
 
 
 def load_model(path, dtype=torch.float16, use_ddim=False, use_dpm=False):
@@ -190,4 +192,4 @@ def main(outputdir:str="none",
 
 
 if __name__ == '__main__':
-    fire.Fire(main)
+   fire.Fire(main)

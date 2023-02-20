@@ -90,8 +90,6 @@ def load_model(path, dtype=torch.float16, use_ddim=False, use_dpm=False):
 
     else:
         pipe = StableDiffusionPipeline.from_pretrained(path, torch_dtype=torch.float16)
-        print(f"Adding 300 extra tokens to tokenizer")
-        pipe.tokenizer.add_tokens([f"<extra-token-{i}>" for i in range(300)])
         affects_prior = True
 
     if use_ddim:
@@ -138,6 +136,14 @@ def get_prompts(subject="the xvw dog", instancetype="thing"):
             f"a dramatic digital portrait painting of {subject}, artistic, greg rutkowski, dramatic harsh light, 4k, trending on artstation",
             f"an oil portrait painting of {subject} in the style of vincent van gogh",
             f"a bust statue of {subject} head, 4k 8k 5k, olympus, canon r3, fujifilm xt3",
+        ]
+    elif instancetype == "style":
+        prompts = [
+            f"a painting of a pretty young woman with red hair and blues eyes in the style of {subject}, dramatic light, masterpiece, detailed",
+            f"a painting of a grumpy old man in the style of {subject}, dramatic light, masterpiece, detailed",
+            f"a painting of a husky dog in the style of {subject}, dramatic light, masterpiece, detailed",
+            f"a painting of a white mayonaise jar in the style of {subject}, dramatic light, masterpiece, detailed",
+            f"a painting of an old church in the style of {subject}, dramatic light, masterpiece, detailed",
         ]
     return prompts
 

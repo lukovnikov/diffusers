@@ -24,6 +24,9 @@ if __name__ == '__main__':
     # pipe._encode_prompt(spec, device, 2, do_classifier_free_guidance=True)
 
     psdimg = psd.PSDImage.open("lion.psd")
-    pipe.convert()
     ret = pipe(psdimg, num_images_per_prompt=2)
     print(ret)
+
+
+# TODO: check that the cross-attention mask has the desired behavior
+# TODO: how does ControlNet work and how do we integrate?

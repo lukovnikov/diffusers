@@ -46,8 +46,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class CrossAttentionWithMask(CrossAttention):
-    pass # TODO: implement cross attention that uses a selective cross-attention mask that controls which words we're allowed to attend to from each pixel
-
     def forward(self, hidden_states, context=None, mask=None):
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -197,7 +195,7 @@ class StableDiffusionPipelineLayers2ImageV1(StableDiffusionPipeline):
     """
     _optional_components = ["safety_checker", "feature_extractor"]
 
-    def new__init__todo(
+    def __init__(
         self,
         vae: AutoencoderKL,
         text_encoder: CLIPTextModel,
@@ -216,73 +214,7 @@ class StableDiffusionPipelineLayers2ImageV1(StableDiffusionPipeline):
         requires_safety_checker: bool = True,
     ):
         # TODO: cast Unet to different unet that takes cross-attention masks
-        super().__init__()
-
-        if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
-            deprecation_message = (
-                f"The configuration file of this scheduler: {scheduler} is outdated. `steps_offset`"
-                f" should be set to 1 instead of {scheduler.config.steps_offset}. Please make sure "
-                "to update the config accordingly as leaving `steps_offset` might led to incorrect results"
-                " in future versions. If you have downloaded this checkpoint from the Hugging Face Hub,"
-                " it would be very nice if you could open a Pull request for the `scheduler/scheduler_config.json`"
-                " file"
-            )
-            deprecate("steps_offset!=1", "1.0.0", deprecation_message, standard_warn=False)
-            new_config = dict(scheduler.config)
-            new_config["steps_offset"] = 1
-            scheduler._internal_dict = FrozenDict(new_config)
-
-        if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is True:
-            deprecation_message = (
-                f"The configuration file of this scheduler: {scheduler} has not set the configuration `clip_sample`."
-                " `clip_sample` should be set to False in the configuration file. Please make sure to update the"
-                " config accordingly as not setting `clip_sample` in the config might lead to incorrect results in"
-                " future versions. If you have downloaded this checkpoint from the Hugging Face Hub, it would be very"
-                " nice if you could open a Pull request for the `scheduler/scheduler_config.json` file"
-            )
-            deprecate("clip_sample not set", "1.0.0", deprecation_message, standard_warn=False)
-            new_config = dict(scheduler.config)
-            new_config["clip_sample"] = False
-            scheduler._internal_dict = FrozenDict(new_config)
-
-        if safety_checker is None and requires_safety_checker:
-            logger.warning(
-                f"You have disabled the safety checker for {self.__class__} by passing `safety_checker=None`. Ensure"
-                " that you abide to the conditions of the Stable Diffusion license and do not expose unfiltered"
-                " results in services or applications open to the public. Both the diffusers team and Hugging Face"
-                " strongly recommend to keep the safety filter enabled in all public facing circumstances, disabling"
-                " it only for use-cases that involve analyzing network behavior or auditing its results. For more"
-                " information, please have a look at https://github.com/huggingface/diffusers/pull/254 ."
-            )
-
-        if safety_checker is not None and feature_extractor is None:
-            raise ValueError(
-                "Make sure to define a feature extractor when loading {self.__class__} if you want to use the safety"
-                " checker. If you do not want to use the safety checker, you can pass `'safety_checker=None'` instead."
-            )
-
-        is_unet_version_less_0_9_0 = hasattr(unet.config, "_diffusers_version") and version.parse(
-            version.parse(unet.config._diffusers_version).base_version
-        ) < version.parse("0.9.0.dev0")
-        is_unet_sample_size_less_64 = hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
-        if is_unet_version_less_0_9_0 and is_unet_sample_size_less_64:
-            deprecation_message = (
-                "The configuration file of the unet has set the default `sample_size` to smaller than"
-                " 64 which seems highly unlikely .If you're checkpoint is a fine-tuned version of any of the"
-                " following: \n- CompVis/stable-diffusion-v1-4 \n- CompVis/stable-diffusion-v1-3 \n-"
-                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- runwayml/stable-diffusion-v1-5"
-                " \n- runwayml/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
-                " configuration file. Please make sure to update the config accordingly as leaving `sample_size=32`"
-                " in the config might lead to incorrect results in future versions. If you have downloaded this"
-                " checkpoint from the Hugging Face Hub, it would be very nice if you could open a Pull request for"
-                " the `unet/config.json` file"
-            )
-            deprecate("sample_size<64", "1.0.0", deprecation_message, standard_warn=False)
-            new_config = dict(unet.config)
-            new_config["sample_size"] = 64
-            unet._internal_dict = FrozenDict(new_config)
-
-        self.register_modules(
+        super().__init__(
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
@@ -290,9 +222,9 @@ class StableDiffusionPipelineLayers2ImageV1(StableDiffusionPipeline):
             scheduler=scheduler,
             safety_checker=safety_checker,
             feature_extractor=feature_extractor,
+            requires_safety_checker=requires_safety_checker
         )
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.register_to_config(requires_safety_checker=requires_safety_checker)
+        self._convert()
 
     def _tokenize_dict(self, d):
         tokenizerout = self.tokenizer(d["pos"], padding="max_length", truncation=True,
@@ -636,7 +568,7 @@ class StableDiffusionPipelineLayers2ImageV1(StableDiffusionPipeline):
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
-    def convert(self):
+    def _convert(self):
         # adapt unet to use StructuredCrossAttention
         print("replacing CrossAttention in BasicTransformerBlock with CrossAttentionWithMask")
         _c = 0

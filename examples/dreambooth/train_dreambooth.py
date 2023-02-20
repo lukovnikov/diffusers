@@ -162,7 +162,6 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--center_crop", action="store_true", help="Whether to center crop images before resizing to resolution"
     )
-    parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
     parser.add_argument(
         "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
@@ -254,6 +253,10 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 
+    parser.add_argument(
+        "--train_unet", action="store_true", help=""
+    )
+    parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
     parser.add_argument(
         "--train_kv_emb_only", action="store_true", help="When enabled, only KV params of cross-attentions are trained, as well as the parameters of the special token(s). (~Custom Diffusion)"
     )
@@ -546,40 +549,45 @@ def main(args):
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load the tokenizer
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name,
-            revision=args.revision,
-            use_fast=False,
-        )
-    elif args.pretrained_model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-            use_fast=False,
-        )
+    loaded_pipe = StableDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path)
+    text_encoder = loaded_pipe.text_encoder.to(torch.float32)
+    vae = loaded_pipe.vae
+    unet = loaded_pipe.unet.to(torch.float32)
+    tokenizer = loaded_pipe.tokenizer
 
-    # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path)
-
-    # Load models and create wrapper for stable diffusion
-    text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-    )
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        revision=args.revision,
-    )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=args.revision,
-    ).to(torch.float32)
+    # # Load the tokenizer
+    # if args.tokenizer_name:
+    #     tokenizer = AutoTokenizer.from_pretrained(
+    #         args.tokenizer_name,
+    #         revision=args.revision,
+    #         use_fast=False,
+    #     )
+    # elif args.pretrained_model_name_or_path:
+    #     tokenizer = AutoTokenizer.from_pretrained(
+    #         args.pretrained_model_name_or_path,
+    #         subfolder="tokenizer",
+    #         revision=args.revision,
+    #         use_fast=False,
+    #     )
+    #
+    # # import correct text encoder class
+    # text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path)
+    # # Load models and create wrapper for stable diffusion
+    # text_encoder = text_encoder_cls.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     subfolder="text_encoder",
+    #     revision=args.revision,
+    # )
+    # vae = AutoencoderKL.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     subfolder="vae",
+    #     revision=args.revision,
+    # )
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     subfolder="unet",
+    #     revision=args.revision,
+    # ).to(torch.float32)
 
 
     #### CUSTOM 3000 extra token, done for all methods just for coding convenience)
@@ -601,6 +609,7 @@ def main(args):
         for extra_token_init in extra_token_inits:
             sourcetoken, initword = extra_token_init.split("=")
             extra_token_spec[sourcetoken] = initword
+            print(f"Using init word: {initword}")
             i = len(extra_token_map)
             numvecs = args.num_vectors_per_extra_token
             extra_token_map[sourcetoken] = [f"<extra-token-{i*numvecs+j}>" for j in range(numvecs)]
@@ -608,12 +617,19 @@ def main(args):
             initword_vector = embed.weight.data[initword_id]
             for j, extra_token in enumerate(extra_token_map[sourcetoken]):
                 randfactor = (.5 if j > 0 else 0.) if args.train_emb_mem else 0.5
-                _initword_vector = initword_vector + torch.randn_like(initword_vector) * initword_vector.std() * randfactor
+                if args.train_unet:
+                    randfactor = 0.8
+                _initword_vector = initword_vector * (1 - randfactor) + torch.randn_like(initword_vector) * initword_vector.std() * randfactor
                 # _initword_vector = torch.randn_like(initword_vector) * initword_vector.std()
                 embed.weight.data[tokenizervocab[extra_token], :] = _initword_vector
-    if len(extra_token_spec) == 1:
+
+    if len(extra_token_spec) == 1:      # automatically infer
         generate_concept, generate_concept_class = list(extra_token_spec.items())[0]
-        print(f"Automatically inferred generate concept and class: {generate_concept}=>{generate_concept_class}")
+    if args.generate_concept is not None:
+        generate_concept = args.generate_concept
+    if args.generate_concept_class is not None:
+        generate_concept_class = args.generate_concept_class
+    print(f"Generate concept and class: {generate_concept}=>{generate_concept_class}")
 
     extra_token_map_ids = {k: [tokenizervocab[vi] for vi in v] for k, v in extra_token_map.items()}     # only used in model saving --> save memory ids too
 
@@ -682,17 +698,24 @@ def main(args):
 
 
     params_to_optimize = list(
-        itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_text_encoder else unet.parameters()
+        itertools.chain(unet.parameters(), text_encoder.parameters())
     )
     allparamstooptimize = list(params_to_optimize)
 
     ####### CUSTOM #######
     toreplace = set()      # parameter names which should be replaced in the base model when reloading finetuned model
+    params_to_optimize = []
+    if args.train_unet:
+        params_to_optimize += list(unet.parameters())
+
+    if args.train_text_encoder:
+        params_to_optimize += list(text_encoder.parameters())
+
     if args.train_emb_only or args.train_emb_mem or args.train_kv_emb_only:
         params_to_optimize = []
 
-    if args.train_emb_only or args.train_emb_mem or args.train_kv_emb_only:
-        print("optimizing token embeddings")
+    if (args.train_unet and not args.train_text_encoder) or args.train_emb_only or args.train_emb_mem or args.train_kv_emb_only:
+        print("optimizing additional token embeddings")
         params_to_optimize.append(embed.weight)
         if args.initialize_extra_tokens:
             print("Optimizing extra tokens only (last 3000 ids)")
@@ -773,14 +796,18 @@ def main(args):
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
-    if args.train_text_encoder:
-        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
-        )
-    else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
-        )
+    unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+    )
+
+    # if args.train_text_encoder:
+    #     unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    #         unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+    #     )
+    # else:
+    #     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    #         unet, optimizer, train_dataloader, lr_scheduler
+    #     )
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -792,8 +819,8 @@ def main(args):
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
     vae.to(accelerator.device, dtype=weight_dtype)
-    if not args.train_text_encoder:
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
+    # if not args.train_text_encoder:
+    #     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -879,17 +906,17 @@ def main(args):
 
                     text_model = text_encoder.module.text_model if isinstance(text_encoder,
                                   torch.nn.parallel.DistributedDataParallel) else text_encoder.text_model
-                    if (args.train_kv_emb_only or args.train_emb_only or args.train_emb_mem) and hasattr(text_model.embeddings.token_embedding, "gradmask"):
+                    if hasattr(text_model.embeddings.token_embedding, "gradmask"):
                         # apply gradmask on embedding
                         text_model.embeddings.token_embedding.weight.grad \
                             *= text_model.embeddings.token_embedding.gradmask
 
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    # params_to_clip = (
+                    #     itertools.chain(unet.parameters(), text_encoder.parameters())
+                    #     if args.train_text_encoder
+                    #     else unet.parameters()
+                    # )
+                    accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -902,11 +929,11 @@ def main(args):
                 if global_step % args.save_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        save_model(unet, text_encoder, save_path, args, accelerator, extra_token_map_ids)
+                        save_model(unet, text_encoder, save_path, args, accelerator, extra_token_map_ids, tokenizer)
 
                 if args.generate_every > 0 and global_step % args.generate_every == 0:
                     if accelerator.is_main_process:
-                        save_model(unet, text_encoder, args.output_dir, args, accelerator, extra_token_map_ids)
+                        save_model(unet, text_encoder, args.output_dir, args, accelerator, extra_token_map_ids, tokenizer)
                         print("generating")
                         # run generator script command
                         import subprocess
@@ -929,14 +956,14 @@ def main(args):
 
     # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
-        save_model(unet, text_encoder, args.output_dir, args, accelerator, extra_token_map_ids)
+        save_model(unet, text_encoder, args.output_dir, args, accelerator, extra_token_map_ids, tokenizer)
         if args.push_to_hub:
             repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
     accelerator.end_training()
 
 
-def save_model(unet, text_encoder, path, args, accelerator, extra_token_map):
+def save_model(unet, text_encoder, path, args, accelerator, extra_token_map, tokenizer):
     # ensure path exists
     Path(path).mkdir(parents=True, exist_ok=True)
     saved = False
@@ -996,6 +1023,7 @@ def save_model(unet, text_encoder, path, args, accelerator, extra_token_map):
             args.pretrained_model_name_or_path,
             unet=accelerator.unwrap_model(unet),
             text_encoder=accelerator.unwrap_model(text_encoder),
+            tokenizer=tokenizer,
             revision=args.revision,
         )
         pipeline.save_pretrained(path)

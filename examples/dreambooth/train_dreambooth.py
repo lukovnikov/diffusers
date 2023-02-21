@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import accelerate
+import json
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -932,7 +933,12 @@ def main(args):
                 if global_step % args.save_every == 0:
                     if accelerator.is_main_process:
                         save_pipeline(accelerator.unwrap_model(unet), accelerator.unwrap_model(text_encoder), args)
+                        json.dump(
+                            {"global_step": global_step},
+                            open(os.path.join(args.output_dir, "progress.json"), "w")
+                        )
                         logger.info(f"Saved pipeline (saving every {args.save_every} updates).")
+
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

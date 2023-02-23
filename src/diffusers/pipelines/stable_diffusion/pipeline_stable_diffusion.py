@@ -693,9 +693,26 @@ class StableDiffusionPipeline(DiffusionPipeline):
 
 
 class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
+    nonincids = None
     @classmethod
-    def generate_position_ids(cls, input_ids):
-        pass  # TODO
+    def generate_position_ids(cls, input_ids, nonincids=None):
+        """
+        Args:
+            input_ids:          tensor of integer ids for the given text (batsize, seqlen)^int32
+            nonincids: list of sets of token ids that belong to one new concept
+
+        Returns:
+
+        """
+        nonincids = cls.nonincids if nonincids is None else nonincids
+        if input_ids.dim() == 2:
+            inc_positions = input_ids[:, :, None] == nonincids[None, None, :]
+        elif input_ids.dim() == 1:
+            inc_positions = input_ids[:, None] == nonincids[None, :]
+        inc_positions = torch.any(inc_positions, -1)
+        inc_positions = (~inc_positions).long()
+        position_ids = torch.cumsum(inc_positions, -1) - 1
+        return position_ids
 
     def _encode_prompt(
             self,
@@ -704,8 +721,6 @@ class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
             num_images_per_prompt,
             do_classifier_free_guidance,
             negative_prompt=None,
-            prompt_embeds: Optional[torch.FloatTensor] = None,
-            negative_prompt_embeds: Optional[torch.FloatTensor] = None,
     ):      # automatically generated position ids by using generate_position_ids
         r"""
         Encodes the prompt into text encoder hidden states.
@@ -723,118 +738,50 @@ class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds`. instead. If not defined, one has to pass `negative_prompt_embeds`. instead.
                 Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
-            prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
         """
         if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
-        if prompt_embeds is None:
-            text_inputs = self.tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids
-            untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
-
-            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
-                    text_input_ids, untruncated_ids
-            ):
-                removed_text = self.tokenizer.batch_decode(
-                    untruncated_ids[:, self.tokenizer.model_max_length - 1: -1]
-                )
-                logger.warning(
-                    "The following part of your input was truncated because CLIP can only handle sequences up to"
-                    f" {self.tokenizer.model_max_length} tokens: {removed_text}"
-                )
-
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = text_inputs.attention_mask.to(device)
-            else:
-                attention_mask = None
-
-            position_ids = self.generate_position_ids(text_input_ids.to(device))
-            prompt_embeds = self.text_encoder(
-                text_input_ids.to(device),
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-            )
-            prompt_embeds = prompt_embeds[0]
-
-        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
-
-        bs_embed, seq_len, _ = prompt_embeds.shape
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
-        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+            prompt = [prompt]
+        batch_size = len(prompt)
+        text_input = prompt
 
         # get unconditional embeddings for classifier free guidance
-        if do_classifier_free_guidance and negative_prompt_embeds is None:
-            uncond_tokens: List[str]
+        if do_classifier_free_guidance:
             if negative_prompt is None:
-                uncond_tokens = [""] * batch_size
+                negative_prompt = [""] * batch_size
             elif type(prompt) is not type(negative_prompt):
                 raise TypeError(
                     f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
                     f" {type(prompt)}."
                 )
             elif isinstance(negative_prompt, str):
-                uncond_tokens = [negative_prompt]
-            elif batch_size != len(negative_prompt):
+                negative_prompt = [negative_prompt]
+
+            if batch_size != len(negative_prompt):
                 raise ValueError(
                     f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
                     f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
                     " the batch size of `prompt`."
                 )
-            else:
-                uncond_tokens = negative_prompt
 
-            max_length = prompt_embeds.shape[1]
-            uncond_input = self.tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
+            text_input = negative_prompt + prompt
 
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = uncond_input.attention_mask.to(device)
-            else:
-                attention_mask = None
+        out = self.tokenizer(text_input, padding="longest", return_tensors="pt")
+        input_ids, attention_mask = out.input_ids, out.attention_mask
+        position_ids = self.generate_position_ids(input_ids.to(device))
+        if position_ids.max() >= self.tokenizer.model_max_length:
+            raise Exception("Input is too long")
+        text_embeds = self.text_encoder(
+            input_ids.to(device),
+            position_ids=position_ids.to(device),
+            attention_mask=attention_mask.to(device),
+        )
+        text_embeds = text_embeds[0]
 
-            negative_position_ids = self.generate_position_ids(uncond_input.input_ids.to(device))
-            negative_prompt_embeds = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                position_ids=negative_position_ids,
-                attention_mask=attention_mask,
-            )
-            negative_prompt_embeds = negative_prompt_embeds[0]
+        text_embeds = text_embeds.to(dtype=self.text_encoder.dtype, device=device)
 
-        if do_classifier_free_guidance:
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-            seq_len = negative_prompt_embeds.shape[1]
+        bs_embed, seq_len, _ = text_embeds.shape
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        text_embeds = text_embeds.repeat(1, num_images_per_prompt, 1)
+        text_embeds = text_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
-            negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
-
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
-
-        return prompt_embeds
+        return text_embeds

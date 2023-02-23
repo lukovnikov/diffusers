@@ -103,7 +103,9 @@ def run_generation(
          concept:str="hta",
          conceptclass:str="hta",
          gpu:int=0,
-         instancetype:str="object"):
+         instancetype:str="object",
+         numimgsperprompt:int=4,
+         savegrid=True):
     loc = locals()
 
     logfile = open("log.txt", "w")
@@ -113,10 +115,12 @@ def run_generation(
     pipe, repldict, globalstep = load_model(modeldir, use_ddim=False, use_dpm=True)  #StableDiffusionPipeline.from_pretrained(outputdir, torch_dtype=torch.float16).to(device)
     pipe = pipe.to(device)
 
-    prompts = get_prompts(concept, instancetype) + get_prompts(conceptclass, instancetype)[0:1]
+    if savegrid:
+        prompts = get_prompts(concept, instancetype) + get_prompts(conceptclass, instancetype)[0:1]
+    else:
+        prompts = get_prompts(concept, instancetype) + get_prompts(conceptclass, instancetype)
     print(f"prompts: {prompts}")
 
-    imgperprompt = 4
     allimages = []
 
     for i, prompt in enumerate(prompts):
@@ -128,20 +132,28 @@ def run_generation(
         generator = torch.Generator(device=device)
         generator.manual_seed(42)
         images = pipe(prompt, num_inference_steps=32, guidance_scale=7.5, eta=0.,
-                      generator=generator, num_images_per_prompt=imgperprompt, output_type="pil").images
+                      generator=generator, num_images_per_prompt=numimgsperprompt, output_type="pil").images
         allimages.append(list(images))
         # imggrid = image_grid(images, 1, imgperprompt)
 
     print("done generating")
     # allimages = list(zip(allimages[:len(allimages)//2], allimages[len(allimages)//2:]))     # get instance and class versions next to each other
     # allimages = [img for imgs in allimages for img in imgs] # flatten
-    allimages = list(zip(*allimages))  # transpose
-    allimages = [img for imgs in allimages for img in imgs]  # flatten
-    print(len(allimages), len(images), len(prompts))
-    allgrid = image_grid(allimages, imgperprompt, len(prompts))
+    if savegrid:
+        allimages = list(zip(*allimages))  # transpose
+        allimages = [img for imgs in allimages for img in imgs]  # flatten
+        print(len(allimages), len(images), len(prompts))
+        allgrid = image_grid(allimages, numimgsperprompt, len(prompts))
 
-    allgrid.save(os.path.join(outputdir, f"grid_at_step_{globalstep}") + ".png")
-    print("grid saved")
+        allgrid.save(os.path.join(outputdir, f"grid_at_step_{globalstep}") + ".png")
+        print("grid saved")
+    else:   # save images separately
+        os.makedirs(os.path.join(outputdir, f"withtoken"), exist_ok=True)
+        os.makedirs(os.path.join(outputdir, f"notoken"), exist_ok=True)
+        allimages = [img for imgs in allimages for img in imgs]   # flatten
+        for i, img in enumerate(allimages):
+            img.save(os.path.join(outputdir, "withtoken" if i < len(allimages) // 2 else "notoken", f"sampled_image_{i}_at_step_{globalstep}.png"))
+        print("images saved")
 
 
 class MyHandler(FileSystemEventHandler):
@@ -150,11 +162,13 @@ class MyHandler(FileSystemEventHandler):
          concept:str="hta",
          conceptclass:str="hta",
          gpu:int=0,
-         instancetype:str="thing"):
+         instancetype:str="thing",
+         numimgsperprompt:int=4):
         self.outputdir = outputdir
         self.watchdir = watchdir
         self.concept = concept
         self.conceptclass = conceptclass
+        self.numimgsperprompt = numimgsperprompt
         self.gpu = gpu
         self.instancetype = instancetype
         self.last_event_timestamp = None
@@ -186,24 +200,25 @@ class MyHandler(FileSystemEventHandler):
 
     def run_generator(self):
         run_generation(self.watchdir, self.outputdir, self.concept, self.conceptclass, gpu=self.gpu,
-                       instancetype=self.instancetype)
+                       instancetype=self.instancetype, numimgsperprompt=self.numimgsperprompt, savegrid=True)
 
 
-def start_generator_server(
-         outputdir:str="none",
-         watchdir:str="none",
+def main(outputdir:str="none",
+         watchdir:str="__none",
+         modeldir:str="__none",
          concept:str="hta",
          conceptclass:str="hta",
          gpu:int=0,
-         instancetype:str="thing"):
-    if __name__ == "__main__":
+         instancetype:str="thing",
+         numimgsperprompt:int=4):
+    if watchdir != "__none":
+        print(f"Starting server")
         if not os.path.exists(watchdir):
             os.makedirs(watchdir, exist_ok=True)
         if not os.path.exists(outputdir):
             os.makedirs(outputdir, exist_ok=True)
         event_handler = MyHandler(outputdir=outputdir, watchdir=watchdir, concept=concept, conceptclass=conceptclass,
-                                  gpu=gpu,
-                                  instancetype=instancetype)
+                                  gpu=gpu, instancetype=instancetype, numimgsperprompt=numimgsperprompt)
         observer = Observer()
         observer.schedule(event_handler, path=watchdir, recursive=True)
         observer.start()
@@ -214,19 +229,11 @@ def start_generator_server(
             observer.stop()
         observer.join()
 
+    else:
+        print(f"Generating images")
+        assert modeldir != "__none"
+        run_generation(modeldir, outputdir, concept, conceptclass, gpu, instancetype, numimgsperprompt, savegrid=False)
 
-def main(outputdir:str="none",
-         watchdir:str="none",
-         concept:str="hta",
-         conceptclass:str="hta",
-         gpu:int=0,
-         instancetype:str="thing"):
-    start_generator_server(outputdir=outputdir,
-                           watchdir=watchdir,
-                           concept=concept,
-                           conceptclass=conceptclass,
-                           gpu=gpu,
-                           instancetype=instancetype)
 
 
 if __name__ == '__main__':

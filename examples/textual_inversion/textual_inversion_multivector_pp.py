@@ -47,7 +47,7 @@ from diffusers import (
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
     StableDiffusionPipeline,
-    UNet2DConditionModel,
+    UNet2DConditionModel, DDIMScheduler,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineTIPP
@@ -99,42 +99,52 @@ def save_embeddings(text_encoder, extratokenids, args, save_path, global_step, c
         return reloaded
 
 
-def load_textual_inversion(paths: Union[str, List[str]], dtype=torch.float16, use_dpm=False, basepipe=None):
+def load_textual_inversion(paths, dtype=torch.float16, use_ddim=False, use_dpm=False, basepipe=None):
     pipe = basepipe
     if isinstance(paths, str):
         paths = [paths]
 
     repldict = {}
     totalextratokens = 0
+    globalstep = None
+    nonincids = []
     for path in paths:
+        path = os.path.join(path, "learned_embeddings.bin") if os.path.isdir(path) else path
         spec = torch.load(path)
         if pipe is None:
             pipe = StableDiffusionPipeline.from_pretrained(spec["pretrained_model_name_or_path"], torch_dtype=dtype)
+            pipe.__class__ = StableDiffusionPipelineTIPP
+        if globalstep is None:
+            globalstep = spec["global_step"]
         # create replacement dictionary, extend tokenizer and embeddings and copy trained vectors
         for token, vectors in spec["tokens"].items():
             num_token_vectors = vectors.size(0)
-            logger.info(f"Adding {num_token_vectors} extra tokens for token '{token}' to tokenizer.")
-            extratokens = [f"<extra-token-{i + totalextratokens}>" for i in range(num_token_vectors)]
+            print(f"Adding {num_token_vectors} extra tokens for token '{token}' to tokenizer.")
+            extratokens = [f"<extra-token-{i+totalextratokens}>" for i in range(num_token_vectors)]
             num_added_tokens = pipe.tokenizer.add_tokens(extratokens)
             assert num_added_tokens == len(extratokens), "Extra tokens must not be present in tokenizer."
             repldict[token] = " ".join(extratokens)
             tokenizervocab = pipe.tokenizer.get_vocab()
+            extratokenids = [tokenizervocab[extratoken] for extratoken in extratokens]
+            nonincids = nonincids + extratokenids[1:]
 
-            logger.info(
-                f"Extending token embedder with {num_token_vectors} extra token vectors and loading saved vectors."
-            )
+            print(f"Extending token embedder with {num_token_vectors} extra token vectors and loading saved vectors.")
             pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
-            token_embeds = pipe.text_encoder.get_input_embeddings()
+            token_embeds = pipe.text_encoder.get_input_embeddings().weight.data
             for i, extratoken in enumerate(extratokens):
-                token_embeds.weight.data[tokenizervocab[extratoken], :] = vectors[i, :]
+                token_embeds[tokenizervocab[extratoken], :] = vectors[i, :]
 
             totalextratokens += len(extratokens)
-    logger.info(f"Loaded a total of {totalextratokens} vectors for {len(paths)} new concepts.")
+    pipe.nonincids = torch.tensor(nonincids)
+    print(f"Loaded a total of {totalextratokens} vectors for {len(paths)} new concepts.")
+
+    if use_ddim:
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 
     if use_dpm:
         pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 
-    return pipe, repldict
+    return pipe, repldict, globalstep
 
 
 def parse_args():

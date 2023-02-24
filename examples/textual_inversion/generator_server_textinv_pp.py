@@ -2,6 +2,7 @@ import collections
 import json
 import os
 import pathlib
+import traceback
 
 import fire
 from diffusers import StableDiffusionPipeline, DDIMScheduler, DPMSolverMultistepScheduler
@@ -12,6 +13,8 @@ import time
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineTIPP
+
 
 def load_model(paths, dtype=torch.float16, use_ddim=False, use_dpm=False, basepipe=None):
     pipe = basepipe
@@ -21,10 +24,13 @@ def load_model(paths, dtype=torch.float16, use_ddim=False, use_dpm=False, basepi
     repldict = {}
     totalextratokens = 0
     globalstep = None
+    nonincids = []
     for path in paths:
-        spec = torch.load(os.path.join(path, "learned_embeddings.bin"))
+        path = os.path.join(path, "learned_embeddings.bin") if os.path.isdir(path) else path
+        spec = torch.load(path)
         if pipe is None:
             pipe = StableDiffusionPipeline.from_pretrained(spec["pretrained_model_name_or_path"], torch_dtype=dtype)
+            pipe.__class__ = StableDiffusionPipelineTIPP
         if globalstep is None:
             globalstep = spec["global_step"]
         # create replacement dictionary, extend tokenizer and embeddings and copy trained vectors
@@ -36,6 +42,8 @@ def load_model(paths, dtype=torch.float16, use_ddim=False, use_dpm=False, basepi
             assert num_added_tokens == len(extratokens), "Extra tokens must not be present in tokenizer."
             repldict[token] = " ".join(extratokens)
             tokenizervocab = pipe.tokenizer.get_vocab()
+            extratokenids = [tokenizervocab[extratoken] for extratoken in extratokens]
+            nonincids = nonincids + extratokenids[1:]
 
             print(f"Extending token embedder with {num_token_vectors} extra token vectors and loading saved vectors.")
             pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
@@ -44,7 +52,9 @@ def load_model(paths, dtype=torch.float16, use_ddim=False, use_dpm=False, basepi
                 token_embeds[tokenizervocab[extratoken], :] = vectors[i, :]
 
             totalextratokens += len(extratokens)
+    pipe.nonincids = torch.tensor(nonincids)
     print(f"Loaded a total of {totalextratokens} vectors for {len(paths)} new concepts.")
+    print(f"Nonincids set to {pipe.nonincids}")
 
     if use_ddim:
         pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
@@ -195,7 +205,8 @@ class MyHandler(FileSystemEventHandler):
                     self.run_generator()
                     self.last_event_timestamp = time.time()
             except Exception as e:
-                self.logfile.write(f"Exception happened: {e}\n")
+                raise e
+                self.logfile.write(f"Exception happened: {e}\n{traceback.format_exc(e)}\n")
                 self.logfile.flush()
 
     def run_generator(self):
@@ -237,4 +248,4 @@ def main(outputdir:str="none",
 
 
 if __name__ == '__main__':
-   fire.Fire(main)
+    fire.Fire(main)

@@ -695,7 +695,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
 class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
     nonincids = None
     @classmethod
-    def generate_position_ids(cls, input_ids, nonincids=None):
+    def generate_position_ids(cls, input_ids, nonincids=None, endtokenid=49407):
         """
         Args:
             input_ids:          tensor of integer ids for the given text (batsize, seqlen)^int32
@@ -704,12 +704,20 @@ class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
         Returns:
 
         """
-        nonincids = cls.nonincids if nonincids is None else nonincids
+        # compute inc positions
+        # nonincids are those for which we won't raise the position id
+        nonincids = cls.nonincids.to(input_ids.device) if nonincids is None else nonincids
         if input_ids.dim() == 2:
             inc_positions = input_ids[:, :, None] == nonincids[None, None, :]
+            inc_positions = torch.any(inc_positions, -1)
+            # prevent from raising on pad_token
+            inc_positions[:, 1:] = inc_positions[:, 1:] | (input_ids[:, :-1] == endtokenid)       # don't raise on any pad_token
         elif input_ids.dim() == 1:
             inc_positions = input_ids[:, None] == nonincids[None, :]
-        inc_positions = torch.any(inc_positions, -1)
+            inc_positions = torch.any(inc_positions, -1)
+            # prevent from raising on pad_token
+            inc_positions[1:] = inc_positions[1:] | (input_ids[:-1] == endtokenid)       # don't raise on any pad_token
+
         inc_positions = (~inc_positions).long()
         position_ids = torch.cumsum(inc_positions, -1) - 1
         return position_ids
@@ -721,6 +729,8 @@ class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
             num_images_per_prompt,
             do_classifier_free_guidance,
             negative_prompt=None,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
     ):      # automatically generated position ids by using generate_position_ids
         r"""
         Encodes the prompt into text encoder hidden states.
@@ -739,6 +749,7 @@ class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
                 `negative_prompt_embeds`. instead. If not defined, one has to pass `negative_prompt_embeds`. instead.
                 Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
         """
+        assert prompt_embeds is None and negative_prompt_embeds is None
         if prompt is not None and isinstance(prompt, str):
             prompt = [prompt]
         batch_size = len(prompt)
@@ -767,7 +778,7 @@ class StableDiffusionPipelineTIPP(StableDiffusionPipeline):
 
         out = self.tokenizer(text_input, padding="longest", return_tensors="pt")
         input_ids, attention_mask = out.input_ids, out.attention_mask
-        position_ids = self.generate_position_ids(input_ids.to(device))
+        position_ids = self.generate_position_ids(input_ids.to(device), self.nonincids.to(device))
         if position_ids.max() >= self.tokenizer.model_max_length:
             raise Exception("Input is too long")
         text_embeds = self.text_encoder(

@@ -49,11 +49,12 @@ from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel, DDIMScheduler,
 )
+from diffusers.models.cross_attention import StructuredCrossAttention, StructuredCrossAttnProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineTIPP
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-
+from diffusers.models.attention import BasicTransformerBlock
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -602,6 +603,16 @@ def main():
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
+    if args.num_token_vectors > 1:
+        logger.info(f"Using structured attention because number of token vectors > 1: {args.num_token_vectors}")
+        for module in unet.modules():
+            if isinstance(module, BasicTransformerBlock):
+                if module.only_cross_attention:
+                    module.attn1.__class__ = StructuredCrossAttention
+                    module.attn1.processor.__class__ = StructuredCrossAttnProcessor
+                module.attn2.__class__ = StructuredCrossAttention
+                module.attn2.processor.__class__ = StructuredCrossAttnProcessor
+
     # Add extra tokens to tokenizer
     logger.info(f"Adding {args.num_token_vectors} extra tokens to tokenizer.")
     extratokens = [f"<extra-token-{i}>" for i in range(args.num_token_vectors)]
@@ -822,7 +833,7 @@ def main():
                 encoder_hidden_states = text_encoder(input_ids, attention_mask=attention_mask, position_ids=position_ids)[0].to(dtype=weight_dtype)
 
                 # Predict the noise residual
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = unet(noisy_latents, timesteps, (encoder_hidden_states, position_ids)).sample
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":

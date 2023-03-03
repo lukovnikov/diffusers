@@ -15,6 +15,7 @@ from typing import Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
+# import torch_scatter
 from torch import nn
 
 from ..utils import deprecate, logging
@@ -289,7 +290,7 @@ class CrossAttention(nn.Module):
 
 class StructuredCrossAttention(CrossAttention):
 
-    def get_attention_scores(self, query, key, attention_mask=None):
+    def get_attention_scores(self, query, key, attention_mask=None, position_ids=None):
         dtype = query.dtype
         if self.upcast_attention:
             query = query.float()
@@ -314,6 +315,14 @@ class StructuredCrossAttention(CrossAttention):
 
         if self.upcast_softmax:
             attention_scores = attention_scores.float()
+
+        # use position ids to group attentions on one position by averaging attention scores on identical positions
+        _position_ids = self.head_to_batch_dim(position_ids[:, :, None].repeat(1, 1, self.heads))
+        _position_ids = _position_ids.transpose(1, 2).repeat(1, attention_scores.size(1), 1)
+        contracted_attention_scores = torch_scatter.scatter(attention_scores, _position_ids, 2, reduce="mean")
+        contracted_attention_mask = torch.zeros_like(attention_scores) - 1e6
+        contracted_attention_mask.scatter_(2, _position_ids, torch.zeros_like(attention_scores))
+        contracted_attention_scores += contracted_attention_mask[:, :, :contracted_attention_scores.size(2)]
 
         attention_probs = attention_scores.softmax(dim=-1)
         attention_probs = attention_probs.to(dtype)
@@ -360,7 +369,7 @@ class CrossAttnProcessor:
 class StructuredCrossAttnProcessor(CrossAttnProcessor):
     def __call__(
         self,
-        attn: CrossAttention,
+        attn: StructuredCrossAttention,
         hidden_states,
         encoder_hidden_states=None,
         attention_mask=None,
@@ -368,6 +377,8 @@ class StructuredCrossAttnProcessor(CrossAttnProcessor):
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         query = attn.to_q(hidden_states)
+
+        encoder_hidden_states, position_ids = encoder_hidden_states         # Change: unpack position ids
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -381,7 +392,8 @@ class StructuredCrossAttnProcessor(CrossAttnProcessor):
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        # Change: feed position ids
+        attention_probs = attn.get_attention_scores(query, key, attention_mask, position_ids=position_ids)
         hidden_states = torch.bmm(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
 

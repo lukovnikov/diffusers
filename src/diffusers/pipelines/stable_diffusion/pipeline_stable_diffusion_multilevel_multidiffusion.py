@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import inspect
+import math
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
@@ -47,7 +48,7 @@ EXAMPLE_DOC_STRING = """
 """
 
 
-class StableDiffusionPanoramaPipeline(DiffusionPipeline):
+class StableDiffusionHighresPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-to-image generation using "MultiDiffusion: Fusing Diffusion Paths for Controlled Image
     Generation".
@@ -342,6 +343,14 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
         return image
 
+    def decode_latents_tensor(self, latents):
+        latents = 1 / self.vae.config.scaling_factor * latents
+        image = self.vae.decode(latents).sample
+        # image = (image / 2 + 0.5).clamp(0, 1)
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        image = image.float()
+        return image
+
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -426,12 +435,14 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    def get_views(self, panorama_height, panorama_width, window_size=64, stride=8):
+    def get_views(self, global_height, global_width, window_size=512, windows_overlap=64):
         # Here, we define the mappings F_i (see Eq. 7 in the MultiDiffusion paper https://arxiv.org/abs/2302.08113)
-        panorama_height /= 8
-        panorama_width /= 8
-        num_blocks_height = (panorama_height - window_size) // stride + 1
-        num_blocks_width = (panorama_width - window_size) // stride + 1
+        global_height //= 8
+        global_width //= 8
+        window_size //= 8
+        stride = window_size - windows_overlap // 8
+        num_blocks_height = (global_height - window_size) // stride + 1
+        num_blocks_width = (global_width - window_size) // stride + 1
         total_num_blocks = int(num_blocks_height * num_blocks_width)
         views = []
         for i in range(total_num_blocks):
@@ -447,8 +458,8 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
-        height: Optional[int] = 512,
-        width: Optional[int] = 2048,
+        height: Optional[int] = 1024,
+        width: Optional[int] = 1024,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -463,6 +474,7 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+            windows_overlap=256
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -586,12 +598,15 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
         )
 
         # 6. Define panorama grid and initialize views for synthesis.
-        views = self.get_views(height, width)
+        views = self.get_views(height, width, windows_overlap=windows_overlap)
         count = torch.zeros_like(latents)
         value = torch.zeros_like(latents)
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        upscale_factor = math.sqrt((width * height) / (512*512))
+
+        views = [("global")] # + views
 
         # 8. Denoising loop
         # Each denoising step also includes refinement of the latents with respect to the
@@ -607,9 +622,17 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
                 # denoised (latent) crops are then averaged to produce the final latent
                 # for the current timestep via MultiDiffusion. Please see Sec. 4.1 in the
                 # MultiDiffusion paper for more details: https://arxiv.org/abs/2302.08113
-                for h_start, h_end, w_start, w_end in views:
+                for view in views:
                     # get the latents corresponding to the current view coordinates
-                    latents_for_view = latents[:, :, h_start:h_end, w_start:w_end]
+                    if view == "global":
+                        image = self.vae.decode(latents)
+                        down_image = torch.nn.functional.interpolate(image, scale_factor=1/upscale_factor, mode="nearest")
+                        latents_for_view = self.vae.encode(down_image.to(self.vae.dtype)).latent_dist.mean
+                        latents_for_view = latents_for_view * self.vae.config.scaling_factor
+                        # latents_for_view = torch.nn.functional.interpolate(latents, scale_factor=1/upscale_factor, mode="bilinear")
+                    else:
+                        h_start, h_end, w_start, w_end = view
+                        latents_for_view = latents[:, :, h_start:h_end, w_start:w_end]
 
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents_for_view] * 2) if do_classifier_free_guidance else latents
@@ -632,8 +655,18 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
                     latents_view_denoised = self.scheduler.step(
                         noise_pred, t, latents_for_view, **extra_step_kwargs
                     ).prev_sample
-                    value[:, :, h_start:h_end, w_start:w_end] += latents_view_denoised
-                    count[:, :, h_start:h_end, w_start:w_end] += 1
+
+                    if view == "global":
+                        image = self.decode_latents_tensor(latents_view_denoised)
+                        up_image = torch.nn.functional.interpolate(image, scale_factor=upscale_factor, mode="bilinear")
+                        latents_view_denoised = self.vae.encode(up_image.to(self.vae.dtype)).latent_dist.mean
+                        latents_view_denoised = latents_view_denoised * self.vae.config.scaling_factor
+                        # latents_view_denoised = torch.nn.functional.interpolate(latents_view_denoised, scale_factor=upscale_factor, mode="bilinear")
+                        value += latents_view_denoised
+                        count += 1
+                    else:
+                        value[:, :, h_start:h_end, w_start:w_end] += latents_view_denoised
+                        count[:, :, h_start:h_end, w_start:w_end] += 1
 
                 # take the MultiDiffusion step. Eq. 5 in MultiDiffusion paper: https://arxiv.org/abs/2302.08113
                 latents = torch.where(count > 0, value / count, value)
@@ -648,7 +681,8 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
         image = self.decode_latents(latents)
 
         # 9. Run safety checker
-        image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        image, has_nsfw_concept = image, False
 
         # 10. Convert to PIL
         if output_type == "pil":
@@ -658,4 +692,3 @@ class StableDiffusionPanoramaPipeline(DiffusionPipeline):
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
-

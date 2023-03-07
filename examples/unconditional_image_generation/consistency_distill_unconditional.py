@@ -859,9 +859,10 @@ def main(args):
     current_phase = 0
     DEBUG = True
     if DEBUG:
-        current_phase = num_phases - 1
+        current_phase = 0
         updates_per_phase = [1] * (num_phases - current_phase)
         args.save_images_epochs = 1
+        args.generate_every = 1
 
     print(f"Trained model has {num_train_timesteps} steps with increments of {base_steps_per_jump} per phase.")
     print(f"Total of {num_phases} phases. Teacher has {args.teacher_steps_per_jump} steps per jump from total {args.teacher_steps} steps.")
@@ -894,7 +895,9 @@ def main(args):
             timesteps = torch.randint(
                 0, current_phase+1, (bsz,), device=clean_images.device
             ).long()
-            timesteps = (timesteps + 1) * base_steps_per_jump - 1
+            timesteps = (timesteps+1) * base_steps_per_jump - 1
+            if timesteps.min() < -1 or timesteps.max() > 1000:
+                raise ValueError(f"Timesteps out of bounds: {timesteps.min().item()}, {timesteps.max().item()}")
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
@@ -925,16 +928,17 @@ def main(args):
                 referencemodel = ema_model.shadow_model if not args.no_student_ema else model
                 x_0_pred = referencemodel(x_tmk, t_.clamp_min(0)).sample.detach()
                 if args.use_skip_model:
-                    cskip_t_, cout_t_ = compute_cskip_and_cout(t_)
+                    cskip_t_, cout_t_ = compute_cskip_and_cout(t_ + 1)
                     x_0_pred = cskip_t_[:, None, None, None] * x_tmk + cout_t_[:, None, None, None] * x_0_pred
-                x_0_pred = torch.where(t_[:, None, None, None] >= 0, x_0_pred, x_tmk)
+                else:
+                    x_0_pred = torch.where(t_[:, None, None, None] >= 0, x_0_pred, x_tmk)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
                 model_output = model(noisy_images, timesteps).sample
                 if args.use_skip_model:
-                    cskip_t_, cout_t_ = compute_cskip_and_cout(timesteps)
-                    model_output = cskip_t_[:, None, None, None] * x_tmk + cout_t_[:, None, None, None] * model_output
+                    cskip_t_, cout_t_ = compute_cskip_and_cout(timesteps + 1)
+                    model_output = cskip_t_[:, None, None, None] * noisy_images + cout_t_[:, None, None, None] * model_output
 
                 loss = F.mse_loss(model_output, x_0_pred, reduction="none")     # match ema prediction from x_tmk to model prediction
                 loss = loss.mean()
@@ -946,12 +950,6 @@ def main(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
-                if len(updates_per_phase) > 0:
-                    updates_per_phase[-1] -= 1
-                    if updates_per_phase[-1] <= 0:
-                        updates_per_phase.pop(-1)
-                        current_phase += 1
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -971,45 +969,72 @@ def main(args):
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+
+            if global_step % args.generate_every == 0:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    unet = accelerator.unwrap_model(model) if not args.use_ema else accelerator.unwrap_model(
+                        ema_model.shadow_model)
+
+                    # region sampling
+                    unet_training = unet.training
+                    unet.eval()
+                    with torch.no_grad():
+                        # generate using one-step generation from a batch of clean images
+                        generator = torch.Generator(device=validation_images.device).manual_seed(0)
+                        noise = torch.randn(validation_images.shape, generator=generator, device=validation_images.device)
+                        timesteps = torch.tensor([(current_phase + 1) * base_steps_per_jump - 1], device=validation_images.device)
+                        noisy_test_images = noise_scheduler.add_noise(validation_images, noise, timesteps)
+
+                        modelpred = unet(noisy_test_images, timesteps).sample.detach()
+                        if args.use_skip_model:
+                            cskip_t_, cout_t_ = compute_cskip_and_cout(timesteps+1)
+                            modelpred = cskip_t_[:, None, None, None] * noisy_test_images + cout_t_[:, None, None, None] * modelpred
+
+                        images = modelpred.detach().cpu().numpy()
+                    unet.train(unet_training)
+
+                    # denormalize the images and save to tensorboard
+                    images_processed = (images * 255).round().astype("uint8")
+                    noisy_test_images = (noisy_test_images.detach().cpu().numpy() * 255).round().astype("uint8")
+
+                    if args.logger == "tensorboard":
+                        accelerator.get_tracker("tensorboard").add_images(
+                            "test_denoised", images_processed, global_step
+                        )
+                        accelerator.get_tracker("tensorboard").add_images(
+                            "test_noisy", noisy_test_images, global_step
+                        )
+                    elif args.logger == "wandb":
+                        accelerator.get_tracker("wandb").log(
+                            {"test_denoised": [wandb.Image(img) for img in images_processed], "global_step": global_step},
+                            step=global_step,
+                        )
+                        accelerator.get_tracker("wandb").log(
+                            {"test_noisy": [wandb.Image(img) for img in noisy_test_images], "global_step": global_step},
+                            step=global_step,
+                        )
+
+            if len(updates_per_phase) > 0:
+                updates_per_phase[-1] -= 1
+                if updates_per_phase[-1] <= 0:
+                    updates_per_phase.pop(-1)
+                    current_phase += 1
+                    current_phase = min(num_phases - 1, current_phase)
+
         progress_bar.close()
 
         accelerator.wait_for_everyone()
 
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
-            if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
-                unet = accelerator.unwrap_model(model) if not args.use_ema else accelerator.unwrap_model(ema_model.shadow_model)
+            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+                unet = accelerator.unwrap_model(model) if not args.use_ema else accelerator.unwrap_model(
+                    ema_model.shadow_model)
                 pipeline = DDPMPipeline(
                     unet=unet,
                     scheduler=noise_scheduler,
                 )
-
-                # generate using one-step generation from a batch of clean images
-                # TODO
-
-                generator = torch.Generator(device=pipeline.device).manual_seed(0)
-                # run pipeline in inference (sample random noise and denoise)
-                images = pipeline(
-                    generator=generator,
-                    batch_size=args.eval_batch_size,
-                    num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="numpy",
-                ).images
-
-                # denormalize the images and save to tensorboard
-                images_processed = (images * 255).round().astype("uint8")
-
-                if args.logger == "tensorboard":
-                    accelerator.get_tracker("tensorboard").add_images(
-                        "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
-                    )
-                elif args.logger == "wandb":
-                    accelerator.get_tracker("wandb").log(
-                        {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch},
-                        step=global_step,
-                    )
-
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
                 # save the model
                 pipeline.save_pretrained(args.output_dir)
                 if args.push_to_hub:

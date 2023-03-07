@@ -649,3 +649,7 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+
+
+# flowers dataset: "huggan/flowers-102-categories"
+# flowers model: "anton-l/ddpm-ema-flowers-64"

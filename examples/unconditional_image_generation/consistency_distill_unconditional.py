@@ -3,8 +3,9 @@ import inspect
 import logging
 import math
 import os
+from copy import deepcopy
 from pathlib import Path
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, Any, Dict, Iterable
 
 import accelerate
 import datasets
@@ -172,6 +173,158 @@ class LocalDDIMScheduler(DDIMScheduler):
     def to(self, device):
         self.alphas_cumprod = self.alphas_cumprod.to(device)
         self.final_alpha_cumprod = self.final_alpha_cumprod.to(device)
+        return self
+
+
+class ShadowEMAModel(torch.nn.Module):
+    def __init__(self,
+                model,
+                decay: float = 0.9999,
+                min_decay: float = 0.0,
+                update_after_step: int = 0,
+                use_ema_warmup: bool = False,
+                inv_gamma: Union[float, int] = 1.0,
+                power: Union[float, int] = 2 / 3,
+                model_cls: Optional[Any] = None,
+                model_config: Dict[str, Any] = None,
+                **kwargs,
+            ):
+        super(ShadowEMAModel, self).__init__()
+        self.shadow_model = deepcopy(model)
+        self.decay = decay
+        self.min_decay = min_decay
+        self.update_after_step = update_after_step
+        self.use_ema_warmup = use_ema_warmup
+        self.inv_gamma = inv_gamma
+        self.power = power
+        self.optimization_step = 0
+        self.cur_decay_value = None  # set in `step()`
+
+        self.model_cls = model_cls
+        self.model_config = model_config
+
+    def get_decay(self, optimization_step: int) -> float:
+        """
+        Compute the decay factor for the exponential moving average.
+        """
+        step = max(0, optimization_step - self.update_after_step - 1)
+
+        if step <= 0:
+            return 0.0
+
+        if self.use_ema_warmup:
+            cur_decay_value = 1 - (1 + step / self.inv_gamma) ** -self.power
+        else:
+            cur_decay_value = (1 + step) / (10 + step)
+
+        cur_decay_value = min(cur_decay_value, self.decay)
+        # make sure decay is not smaller than min_decay
+        cur_decay_value = max(cur_decay_value, self.min_decay)
+        return cur_decay_value
+
+    @torch.no_grad()
+    def step(self, model: torch.nn.Module):
+        named_params = dict(model.named_parameters())
+        shadow_params = dict(self.shadow_model.named_parameters())
+
+        self.optimization_step += 1
+
+        # Compute the decay factor for the exponential moving average.
+        decay = self.get_decay(self.optimization_step)
+        self.cur_decay_value = decay
+        one_minus_decay = 1 - decay
+
+        for k in named_params.keys():
+            if named_params[k].requires_grad:
+                shadow_params[k].sub_(one_minus_decay * (shadow_params[k] - named_params[k].data))
+            else:
+                shadow_params[k].copy_(named_params[k].data)
+
+        torch.cuda.empty_cache()
+
+    def copy_to(self, model) -> None:
+        """
+        Copy current averaged parameters into given collection of parameters.
+
+        Args:
+            parameters: Iterable of `torch.nn.Parameter`; the parameters to be
+                updated with the stored moving averages. If `None`, the parameters with which this
+                `ExponentialMovingAverage` was initialized will be used.
+        """
+        parameters = list(model.parameters)
+        for s_param, param in zip(self.shadow_model.parameters(), parameters):
+            param.data.copy_(s_param.to(param.device).data)
+
+    def to(self, device=None, dtype=None) -> None:
+        r"""Move internal buffers of the ExponentialMovingAverage to `device`.
+
+        Args:
+            device: like `device` argument to `torch.Tensor.to`
+        """
+        # .to() on the tensors handles None correctly
+        self.shadow_model.to(device=device, dtype=dtype)
+        return self
+
+    def state_dict(self) -> dict:
+        r"""
+        Returns the state of the ExponentialMovingAverage as a dict. This method is used by accelerate during
+        checkpointing to save the ema state dict.
+        """
+        # Following PyTorch conventions, references to tensors are returned:
+        # "returns a reference to the state and not its copy!" -
+        # https://pytorch.org/tutorials/beginner/saving_loading_models.html#what-is-a-state-dict
+        return {
+            "decay": self.decay,
+            "min_decay": self.min_decay,
+            "optimization_step": self.optimization_step,
+            "update_after_step": self.update_after_step,
+            "use_ema_warmup": self.use_ema_warmup,
+            "inv_gamma": self.inv_gamma,
+            "power": self.power,
+            "shadow_model": self.shadow_model,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        r"""
+        Args:
+        Loads the ExponentialMovingAverage state. This method is used by accelerate during checkpointing to save the
+        ema state dict.
+            state_dict (dict): EMA state. Should be an object returned
+                from a call to :meth:`state_dict`.
+        """
+        # deepcopy, to be consistent with module API
+        state_dict = deepcopy(state_dict)
+
+        self.decay = state_dict.get("decay", self.decay)
+        if self.decay < 0.0 or self.decay > 1.0:
+            raise ValueError("Decay must be between 0 and 1")
+
+        self.min_decay = state_dict.get("min_decay", self.min_decay)
+        if not isinstance(self.min_decay, float):
+            raise ValueError("Invalid min_decay")
+
+        self.optimization_step = state_dict.get("optimization_step", self.optimization_step)
+        if not isinstance(self.optimization_step, int):
+            raise ValueError("Invalid optimization_step")
+
+        self.update_after_step = state_dict.get("update_after_step", self.update_after_step)
+        if not isinstance(self.update_after_step, int):
+            raise ValueError("Invalid update_after_step")
+
+        self.use_ema_warmup = state_dict.get("use_ema_warmup", self.use_ema_warmup)
+        if not isinstance(self.use_ema_warmup, bool):
+            raise ValueError("Invalid use_ema_warmup")
+
+        self.inv_gamma = state_dict.get("inv_gamma", self.inv_gamma)
+        if not isinstance(self.inv_gamma, (float, int)):
+            raise ValueError("Invalid inv_gamma")
+
+        self.power = state_dict.get("power", self.power)
+        if not isinstance(self.power, (float, int)):
+            raise ValueError("Invalid power")
+
+        shadow_model = state_dict.get("shadow_model", None)
+        self.shadow_model.load_state_dict(shadow_model)
 
 
 def parse_args():
@@ -192,6 +345,34 @@ def parse_args():
         type=int,
         default=4
     )
+
+    parser.add_argument(
+        "--no_student_ema",
+        default=False,
+        action="store_true",
+        help=(
+            "Do not use ema in training"
+        ),
+    )
+
+    parser.add_argument(
+        "--use_skip_model",
+        action="store_true",
+        help=(
+            "Whether to use skip formulation"
+        ),
+    )
+
+    parser.add_argument(
+        "--no_skip_model",
+        action="store_false",
+        dest="use_skip_model",
+        help=(
+            "Whether to use skip formulation"
+        ),
+    )
+    parser.set_defaults(use_skip_model=True)
+
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -311,11 +492,7 @@ def parse_args():
         "--adam_weight_decay", type=float, default=1e-6, help="Weight decay magnitude for the Adam optimizer."
     )
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer.")
-    parser.add_argument(
-        "--use_ema",
-        action="store_true",
-        help="Whether to use Exponential Moving Average for the final model weights.",
-    )
+
     parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
     parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
     parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
@@ -401,6 +578,7 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    args.use_ema = True
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -419,6 +597,13 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{username}/{model_id}"
     else:
         return f"{organization}/{model_id}"
+
+
+def compute_cskip_and_cout(t, T=1000, M=80, sigmadata=0.5):
+    t = t * M / T
+    cskip = (sigmadata ** 2) / (t ** 2 + sigmadata ** 2)
+    cout = 2 * sigmadata * t / torch.sqrt(sigmadata ** 2 + t ** 2)
+    return cskip, cout
 
 
 def main(args):
@@ -539,9 +724,10 @@ def main(args):
         model = UNet2DModel.from_config(config)
 
     # Create EMA for the model.
+    ema_model = None
     if args.use_ema:
-        ema_model = EMAModel(
-            model.parameters(),
+        ema_model = ShadowEMAModel(
+            model,
             decay=args.ema_max_decay,
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
@@ -610,15 +796,12 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler, teacher = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler, teacher
+    model, optimizer, train_dataloader, lr_scheduler, teacherunet, ema_model = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler, teacher.unet, ema_model
     )
+    teacher.unet = teacherunet
+    teacher.scheduler.to(teacherunet.device)
 
-    if args.use_ema:
-        ema_model.to(accelerator.device)
-
-    teacher.to(accelerator.device)
-    teacher.scheduler.to(accelerator.device)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -739,12 +922,19 @@ def main(args):
 
                 # Use model to compute reference x_0 from x_tmk
                 t_ = timesteps - base_steps_per_jump
-                x_0_pred = model(x_tmk, t_.clamp_min(0)).sample.detach()
+                referencemodel = ema_model.shadow_model if not args.no_student_ema else model
+                x_0_pred = referencemodel(x_tmk, t_.clamp_min(0)).sample.detach()
+                if args.use_skip_model:
+                    cskip_t_, cout_t_ = compute_cskip_and_cout(t_)
+                    x_0_pred = cskip_t_[:, None, None, None] * x_tmk + cout_t_[:, None, None, None] * x_0_pred
                 x_0_pred = torch.where(t_[:, None, None, None] >= 0, x_0_pred, x_tmk)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
                 model_output = model(noisy_images, timesteps).sample
+                if args.use_skip_model:
+                    cskip_t_, cout_t_ = compute_cskip_and_cout(timesteps)
+                    model_output = cskip_t_[:, None, None, None] * x_tmk + cout_t_[:, None, None, None] * model_output
 
                 loss = F.mse_loss(model_output, x_0_pred, reduction="none")     # match ema prediction from x_tmk to model prediction
                 loss = loss.mean()
@@ -766,7 +956,7 @@ def main(args):
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_model.step(model.parameters())
+                    ema_model.step(model)
                 progress_bar.update(1)
                 global_step += 1
 
@@ -788,15 +978,14 @@ def main(args):
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
             if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
-                unet = accelerator.unwrap_model(model)
-                if args.use_ema:
-                    ema_model.copy_to(unet.parameters())
+                unet = accelerator.unwrap_model(model) if not args.use_ema else accelerator.unwrap_model(ema_model.shadow_model)
                 pipeline = DDPMPipeline(
                     unet=unet,
                     scheduler=noise_scheduler,
                 )
 
                 # generate using one-step generation from a batch of clean images
+                # TODO
 
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
                 # run pipeline in inference (sample random noise and denoise)

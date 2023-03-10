@@ -1,6 +1,11 @@
+from shutil import copy
+
+from functools import partial
+
 import argparse
 import inspect
 import logging
+import lpips
 import math
 import os
 from copy import deepcopy
@@ -50,130 +55,6 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
-
-
-class LocalDDIMScheduler(DDIMScheduler):
-    # Support specifying a tensor "timestep" with different values
-    def step(
-        self,
-        model_output: torch.FloatTensor,
-        timestep: torch.LongTensor,
-        sample: torch.FloatTensor,
-        eta: float = 0.0,
-        use_clipped_model_output: bool = False,
-        generator=None,
-        variance_noise: Optional[torch.FloatTensor] = None,
-        return_dict: bool = True,
-    ) -> Union[DDIMSchedulerOutput, Tuple]:
-        """
-        Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
-        process from the learned model outputs (most often the predicted noise).
-
-        Args:
-            model_output (`torch.FloatTensor`): direct output from learned diffusion model.
-            timestep (`int`): current discrete timestep in the diffusion chain.
-            sample (`torch.FloatTensor`):
-                current instance of sample being created by diffusion process.
-            eta (`float`): weight of noise for added noise in diffusion step.
-            use_clipped_model_output (`bool`): if `True`, compute "corrected" `model_output` from the clipped
-                predicted original sample. Necessary because predicted original sample is clipped to [-1, 1] when
-                `self.config.clip_sample` is `True`. If no clipping has happened, "corrected" `model_output` would
-                coincide with the one provided as input and `use_clipped_model_output` will have not effect.
-            generator: random number generator.
-            variance_noise (`torch.FloatTensor`): instead of generating noise for the variance using `generator`, we
-                can directly provide the noise for the variance itself. This is useful for methods such as
-                CycleDiffusion. (https://arxiv.org/abs/2210.05559)
-            return_dict (`bool`): option for returning tuple rather than DDIMSchedulerOutput class
-
-        Returns:
-            [`~schedulers.scheduling_utils.DDIMSchedulerOutput`] or `tuple`:
-            [`~schedulers.scheduling_utils.DDIMSchedulerOutput`] if `return_dict` is True, otherwise a `tuple`. When
-            returning a tuple, the first element is the sample tensor.
-
-        """
-        if self.num_inference_steps is None:
-            raise ValueError(
-                "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
-            )
-
-        # See formulas (12) and (16) of DDIM paper https://arxiv.org/pdf/2010.02502.pdf
-        # Ideally, read DDIM paper in-detail understanding
-
-        # Notation (<variable name> -> <name in paper>
-        # - pred_noise_t -> e_theta(x_t, t)
-        # - pred_original_sample -> f_theta(x_t, t) or x_0
-        # - std_dev_t -> sigma_t
-        # - eta -> η
-        # - pred_sample_direction -> "direction pointing to x_t"
-        # - pred_prev_sample -> "x_t-1"
-
-        # 1. get previous step value (=t-1)
-        prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
-
-        # 2. compute alphas, betas
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep.clamp_min(0)]
-        alpha_prod_t_prev = torch.where(prev_timestep >= 0, alpha_prod_t_prev, self.final_alpha_cumprod)
-        beta_prod_t = 1 - alpha_prod_t
-
-        alpha_prod_t = alpha_prod_t[:, None, None, None]
-        alpha_prod_t_prev = alpha_prod_t_prev[:, None, None, None]
-        beta_prod_t = beta_prod_t[:, None, None, None]
-
-        # 3. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        if self.config.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-        elif self.config.prediction_type == "sample":
-            pred_original_sample = model_output
-        elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
-            # predict V
-            model_output = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
-        else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
-                " `v_prediction`"
-            )
-
-        # 4. Clip "predicted x_0"
-        if self.config.clip_sample:
-            pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
-
-        # 5. compute variance: "sigma_t(η)" -> see formula (16)
-        # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-        variance = self._get_variance(alpha_prod_t, alpha_prod_t_prev)
-        std_dev_t = eta * variance ** (0.5)
-
-        if use_clipped_model_output:
-            # the model_output is always re-derived from the clipped x_0 in Glide
-            model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
-
-        # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * model_output
-
-        # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
-
-        if not return_dict:
-            return (prev_sample,)
-
-        return DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
-
-    def _get_variance(self, alpha_prod_t, alpha_prod_t_prev):
-        # alpha_prod_t = self.alphas_cumprod[timestep]
-        # alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
-
-        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
-
-        return variance
-
-    def to(self, device):
-        self.alphas_cumprod = self.alphas_cumprod.to(device)
-        self.final_alpha_cumprod = self.final_alpha_cumprod.to(device)
-        return self
 
 
 class ShadowEMAModel(torch.nn.Module):
@@ -273,7 +154,7 @@ class ShadowEMAModel(torch.nn.Module):
         # Following PyTorch conventions, references to tensors are returned:
         # "returns a reference to the state and not its copy!" -
         # https://pytorch.org/tutorials/beginner/saving_loading_models.html#what-is-a-state-dict
-        return {
+        ret = {
             "decay": self.decay,
             "min_decay": self.min_decay,
             "optimization_step": self.optimization_step,
@@ -281,8 +162,10 @@ class ShadowEMAModel(torch.nn.Module):
             "use_ema_warmup": self.use_ema_warmup,
             "inv_gamma": self.inv_gamma,
             "power": self.power,
-            "shadow_model": self.shadow_model,
+            "shadow_model": self.shadow_model.state_dict(),
         }
+        # ret = {k: torch.tensor(v) if isinstance(v, (bool, int, float)) else v for k, v in ret.items()}
+        return ret
 
     def load_state_dict(self, state_dict: dict) -> None:
         r"""
@@ -326,32 +209,48 @@ class ShadowEMAModel(torch.nn.Module):
         shadow_model = state_dict.get("shadow_model", None)
         self.shadow_model.load_state_dict(shadow_model)
 
+    @classmethod
+    def from_pretrained(cls, path, model_cls) -> "ShadowEMAModel":
+        _, ema_kwargs = model_cls.load_config(path, return_unused_kwargs=True)
+        ema_config = ema_kwargs["ema_config"]
+        model = model_cls.from_pretrained(path)
+
+        ema_model = cls(model, model_cls=model_cls, model_config=model.config)
+
+        ema_model.load_state_dict(ema_config)
+        return ema_model
+
+    def save_pretrained(self, path):
+        if self.model_cls is None:
+            raise ValueError("`save_pretrained` can only be used if `model_cls` was defined at __init__.")
+
+        if self.model_config is None:
+            raise ValueError("`save_pretrained` can only be used if `model_config` was defined at __init__.")
+
+        state_dict = self.state_dict()
+        state_dict.pop("shadow_model", None)
+
+        self.shadow_model.register_to_config(ema_config=state_dict)
+        self.shadow_model.save_pretrained(path)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--teacher_model",
-        type=str,
-        default=None,
-        help="Model from which to distill."
-    )
-    parser.add_argument(
-        "--teacher_steps",
-        type=int,
-        default=200
-    )
-    parser.add_argument(
-        "--teacher_steps_per_jump",
-        type=int,
-        default=4
-    )
-
     parser.add_argument(
         "--no_student_ema",
         default=False,
         action="store_true",
         help=(
             "Do not use ema in training"
+        ),
+    )
+
+    parser.add_argument(
+        "--max_noise_level_jump",
+        type=int,
+        default=1,
+        help=(
+            "How many noise levels to increase the max noise level when advancing the distillation process."
         ),
     )
 
@@ -373,6 +272,13 @@ def parse_args():
     )
     parser.set_defaults(use_skip_model=True)
 
+    parser.add_argument(
+        "--use_lpips",
+        action="store_true",
+        help=(
+            "Whether to use LPIPS loss instead of L2."
+        ),
+    )
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -408,7 +314,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="ddpm-model-64",
+        default="consistency-64",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
@@ -458,7 +364,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
+    parser.add_argument("--save_images_epochs", type=int, default=1, help="How often to save images during training.")
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
     )
@@ -495,18 +401,8 @@ def parse_args():
 
     parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
     parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
-    parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
-    )
+    parser.add_argument("--ema_max_decay", type=float, default=0.99, help="The maximum decay magnitude for EMA.")
+
     parser.add_argument(
         "--logger",
         type=str,
@@ -538,18 +434,7 @@ def parse_args():
             "and an Nvidia Ampere GPU."
         ),
     )
-    """
-    parser.add_argument(
-        "--prediction_type",
-        type=str,
-        default="epsilon",
-        choices=["epsilon", "sample"],
-        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
-    )
-    # """
-    parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
+    parser.add_argument("--num_noise_levels", type=int, default=1000)
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -581,6 +466,8 @@ def parse_args():
 
     args = parser.parse_args()
     args.use_ema = True
+    args.checkpointing_steps = int(1e12)
+
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -606,6 +493,16 @@ def compute_cskip_and_cout(t, T=1000, M=80, sigmadata=0.5):
     cskip = (sigmadata ** 2) / (t ** 2 + sigmadata ** 2)
     cout = 2 * sigmadata * t / torch.sqrt(sigmadata ** 2 + t ** 2)
     return cskip, cout
+
+
+def add_noise(images, noise, noise_levels, max_noise_levels):
+    while noise_levels.dim() < images.dim():
+        noise_levels = noise_levels.unsqueeze(-1)
+
+    denoise_progress_t = noise_levels / max_noise_levels
+    noise = torch.tanh(noise)       # tanh of gaussian
+    x_t = images * (1 - denoise_progress_t) + noise * denoise_progress_t
+    return x_t
 
 
 def main(args):
@@ -634,31 +531,25 @@ def main(args):
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
-            if args.use_ema:
-                ema_model.save_pretrained(os.path.join(output_dir, "unet_ema"))
-
-            for i, model in enumerate(models):
-                model.save_pretrained(os.path.join(output_dir, "unet"))
-
-                # make sure to pop weight so that corresponding model is not saved again
+            modelcount = 0
+            for model in models:
+                if isinstance(model, ShadowEMAModel):
+                    model.save_pretrained(os.path.join(output_dir, f"unet_ema"))
+                    modelcount += 1
+                else:
+                    model.save_pretrained(os.path.join(output_dir, f"unet"))
+                    modelcount += 1
                 weights.pop()
 
         def load_model_hook(models, input_dir):
-            if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel)
-                ema_model.load_state_dict(load_model.state_dict())
-                ema_model.to(accelerator.device)
-                del load_model
-
-            for i in range(len(models)):
-                # pop models so that they are not loaded again
-                model = models.pop()
-
-                # load diffusers style into model
-                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
-                model.register_to_config(**load_model.config)
-
+            for model in models:
+                if isinstance(model, ShadowEMAModel):
+                    load_model = ShadowEMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel)
+                else:
+                    load_model = UNet2DModel.from_pretrained(os.path.join(input_dir, "unet"))
+                    model.register_to_config(**load_model.config)
                 model.load_state_dict(load_model.state_dict())
+                model.to(accelerator.device)
                 del load_model
 
         accelerator.register_save_state_pre_hook(save_model_hook)
@@ -680,31 +571,9 @@ def main(args):
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            create_repo(repo_name, exist_ok=True, token=args.hub_token)
-            repo = Repository(args.output_dir, clone_from=repo_name, token=args.hub_token)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
+        if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # scheduler = DDIMScheduler.from_pretrained(args.teacher_model)
-    teacher = DDIMPipeline.from_pretrained(args.teacher_model)
-    teacher.scheduler.__class__ = LocalDDIMScheduler
-
-    model = deepcopy(teacher)
-
-    teacher_prediction_type = teacher.scheduler.prediction_type
-
-    """
     # Initialize the model
     if args.model_config_name_or_path is None:
         model = UNet2DModel(
@@ -743,9 +612,6 @@ def main(args):
             model_cls=UNet2DModel,
             model_config=model.config,
         )
-
-    # Initialize the scheduler
-    noise_scheduler = teacher.scheduler
 
     # Initialize the optimizer
     optimizer = torch.optim.AdamW(
@@ -804,11 +670,9 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler, teacherunet, ema_model = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler, teacher.unet, ema_model
+    model, optimizer, train_dataloader, lr_scheduler, ema_model = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler, ema_model
     )
-    teacher.unet = teacherunet
-    teacher.scheduler.to(teacherunet.device)
 
 
     # We need to initialize the trackers we use, and also store our configuration.
@@ -859,28 +723,37 @@ def main(args):
 
 
     # define training phases
-    num_phases = args.teacher_steps // args.teacher_steps_per_jump
-    updates_per_phase = [max_train_steps // num_phases] * num_phases
-    num_train_timesteps = noise_scheduler.config.num_train_timesteps
-    base_steps_per_teacher_step = num_train_timesteps // args.teacher_steps
-    base_steps_per_jump = num_train_timesteps // num_phases
-    current_phase = 0
-    DEBUG = True
-    if DEBUG:
-        current_phase = 0
-        updates_per_phase = [1] * (num_phases - current_phase)
-        args.save_images_epochs = 1
-        args.generate_every = 1
+    train_steps_per_noise_level =  int(round(max_train_steps * 0.7)) // args.num_noise_levels
+    train_steps_per_noise_level *= args.max_noise_level_jump
 
-    print(f"Trained model has {num_train_timesteps} steps with increments of {base_steps_per_jump} per phase.")
-    print(f"Total of {num_phases} phases. Teacher has {args.teacher_steps_per_jump} steps per jump from total {args.teacher_steps} steps.")
+    generate_every = args.save_images_epochs * num_update_steps_per_epoch
 
+    print(f"Training has {train_steps_per_noise_level} steps per noise level increase.")
+
+    # get validation images
     validation_images = []
     for step, batch in enumerate(train_dataloader):
         validation_images.append(batch["input"])
         if len(validation_images) * validation_images[-1].size(0) >= args.eval_batch_size:
             break
     validation_images = torch.cat(validation_images, 0)[:args.eval_batch_size]
+
+    current_max_noise_level = args.max_noise_level_jump
+    updates_left = train_steps_per_noise_level
+
+    # define loss
+    loss_fn = lpips.LPIPS(net='vgg').to(accelerator.device) if args.use_lpips else partial(F.mse_loss, reduction="none")
+    DEBUG = False
+    # DEBUG = True
+    if DEBUG:
+        # current_max_noise_level = 100
+        train_steps_per_noise_level = 1
+        generate_every = 1
+        updates_left = train_steps_per_noise_level
+
+    def noise_level_for_model(_noise_level):
+        ret = (_noise_level * 1000 / args.num_noise_levels).long()
+        return ret
 
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
@@ -900,55 +773,36 @@ def main(args):
             bsz = clean_images.shape[0]
             # Sample a random timestep for each image
             # Limit the range of timesteps according to training phase
-            timesteps = torch.randint(
-                0, current_phase+1, (bsz,), device=clean_images.device
+            noise_levels_t = torch.randint(
+                0, current_max_noise_level, (bsz,), device=clean_images.device
             ).long()
-            timesteps = (timesteps+1) * base_steps_per_jump - 1
-            if timesteps.min() < -1 or timesteps.max() > 1000:
-                raise ValueError(f"Timesteps out of bounds: {timesteps.min().item()}, {timesteps.max().item()}")
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-
-            # starting from noisy images, denoise a few steps using DDIM (TODO: add support for better ODE solvers)
-            # Denoise a few steps using teacher model
-            # set step values
-            teacher.scheduler.set_timesteps(args.teacher_steps)
 
             with torch.no_grad():
-                image = noisy_images
-                for k in range(args.teacher_steps_per_jump):
-                    # 1. predict noise model_output
-                    t_ = timesteps - k * base_steps_per_teacher_step
-                    model_output = teacher.unet(image, t_).sample
-
-                    # 2. predict previous mean of image x_t-1 and add variance depending on eta
-                    # eta corresponds to η in paper and should be between [0, 1]
-                    # do x_t -> x_t-1
-                    image = teacher.scheduler.step(
-                        model_output, t_, image, eta=0, use_clipped_model_output=True, generator=None
-                    ).prev_sample
-                x_tmk = image
-
-                # Use model to compute reference x_0 from x_tmk
-                t_ = timesteps - base_steps_per_jump
+                x_t = add_noise(clean_images, noise, noise_levels_t+1, args.num_noise_levels)
+                x_tm1 = add_noise(clean_images, noise, noise_levels_t, args.num_noise_levels)
+                # Use (ema) model to compute reference x_0 from x_tmk
+                noise_levels_tm1 = noise_levels_t - 1e-3
+                # noise_levels_tm1 = noise_levels_tm1.float() * torch.rand_like(noise_levels_tm1.float())
+                noise_levels_tm1 = torch.floor(noise_levels_tm1).long()
                 referencemodel = ema_model.shadow_model if not args.no_student_ema else model
-                x_0_pred = referencemodel(x_tmk, t_.clamp_min(0)).sample.detach()
+                x_0_pred = referencemodel(x_tm1, noise_level_for_model(noise_levels_tm1.clamp_min(0))).sample.detach()
                 if args.use_skip_model:
-                    cskip_t_, cout_t_ = compute_cskip_and_cout(t_ + 1)
-                    x_0_pred = cskip_t_[:, None, None, None] * x_tmk + cout_t_[:, None, None, None] * x_0_pred
+                    cskip_tm1, cout_tm1 = compute_cskip_and_cout(noise_levels_tm1 + 1, T=args.num_noise_levels)
+                    x_0_pred = cskip_tm1[:, None, None, None] * x_tm1 + cout_tm1[:, None, None, None] * x_0_pred
                 else:
-                    x_0_pred = torch.where(t_[:, None, None, None] >= 0, x_0_pred, x_tmk)
+                    x_0_pred = torch.where(noise_levels_tm1[:, None, None, None] >= 0, x_0_pred, x_tm1)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                model_output = model(noisy_images, timesteps).sample
+                model_output = model(x_t, noise_level_for_model(noise_levels_t)).sample
                 if args.use_skip_model:
-                    cskip_t_, cout_t_ = compute_cskip_and_cout(timesteps + 1)
-                    model_output = cskip_t_[:, None, None, None] * noisy_images + cout_t_[:, None, None, None] * model_output
+                    cskip_t, cout_t = compute_cskip_and_cout(noise_levels_t + 1, T=args.num_noise_levels)
+                    model_output = cskip_t[:, None, None, None] * x_t + cout_t[:, None, None, None] * model_output
 
-                loss = F.mse_loss(model_output, x_0_pred, reduction="none")     # match ema prediction from x_tmk to model prediction
+                loss = loss_fn(model_output, x_0_pred)     # match ema prediction from x_tmk to model prediction
                 loss = loss.mean()
 
                 accelerator.backward(loss)
@@ -958,6 +812,8 @@ def main(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+                updates_left -= 1
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -978,7 +834,7 @@ def main(args):
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
-            if global_step % args.generate_every == 0:
+            if global_step % generate_every == 0:
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     unet = accelerator.unwrap_model(model) if not args.use_ema else accelerator.unwrap_model(
@@ -991,16 +847,19 @@ def main(args):
                         # generate using one-step generation from a batch of clean images
                         generator = torch.Generator(device=validation_images.device).manual_seed(0)
                         noise = torch.randn(validation_images.shape, generator=generator, device=validation_images.device)
-                        timesteps = torch.tensor([(current_phase + 1) * base_steps_per_jump - 1], device=validation_images.device)
-                        noisy_test_images = noise_scheduler.add_noise(validation_images, noise, timesteps)
+                        noise_levels_t = torch.tensor([current_max_noise_level-1], device=validation_images.device)
+                        noisy_test_images = add_noise(validation_images, noise, noise_levels_t+1, args.num_noise_levels)
 
-                        modelpred = unet(noisy_test_images, timesteps).sample.detach()
+                        model_output = unet(noisy_test_images, noise_level_for_model(noise_levels_t)).sample.detach()
                         if args.use_skip_model:
-                            cskip_t_, cout_t_ = compute_cskip_and_cout(timesteps+1)
-                            modelpred = cskip_t_[:, None, None, None] * noisy_test_images + cout_t_[:, None, None, None] * modelpred
+                            cskip_t, cout_t = compute_cskip_and_cout(noise_levels_t + 1, T=args.num_noise_levels)
+                            modelpred = cskip_t[:, None, None, None] * noisy_test_images + cout_t[:, None, None, None] * model_output
 
                         images = modelpred.detach().cpu().numpy()
                     unet.train(unet_training)
+
+                    images = images * 0.5 + 0.5
+                    noisy_test_images = noisy_test_images * 0.5 + 0.5
 
                     # denormalize the images and save to tensorboard
                     images_processed = (images * 255).round().astype("uint8")
@@ -1023,30 +882,25 @@ def main(args):
                             step=global_step,
                         )
 
-            if len(updates_per_phase) > 0:
-                updates_per_phase[-1] -= 1
-                if updates_per_phase[-1] <= 0:
-                    updates_per_phase.pop(-1)
-                    current_phase += 1
-                    current_phase = min(num_phases - 1, current_phase)
+            if updates_left <= 0:
+                updates_left = train_steps_per_noise_level
+                current_max_noise_level = min(current_max_noise_level + args.max_noise_level_jump, args.num_noise_levels)
+                print(f"increased noise level to {current_max_noise_level}/{args.num_noise_levels}")
 
         progress_bar.close()
 
         accelerator.wait_for_everyone()
 
-        # Generate sample images for visual inspection
+        # save model
         if accelerator.is_main_process:
             if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
-                unet = accelerator.unwrap_model(model) if not args.use_ema else accelerator.unwrap_model(
-                    ema_model.shadow_model)
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
-                # save the model
-                pipeline.save_pretrained(args.output_dir)
-                if args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
+                unet = accelerator.unwrap_model(model)
+                unet.save_pretrained(os.path.join(args.output_dir, "unet"))
+                # copy(os.path.join(args.output_dir, "unet"), os.path.join(args.output_dir, f"unet_step_{global_step}"))
+                if args.use_ema:
+                    ema_unet = accelerator.unwrap_model(ema_model.shadow_model)
+                    ema_unet.save_pretrained(os.path.join(args.output_dir, "unet_ema"))
+                    # copy(os.path.join(args.output_dir, "unet_ema"), os.path.join(args.output_dir, f"unet_ema_step_{global_step}"))
 
     accelerator.end_training()
 

@@ -54,7 +54,7 @@ class LayerMode(Enum):
     NORMAL = "normal"
 
 
-def unpack_layers(layers):
+def unpack_layers(layers, trilevel=False):
     # Unpacks the layers PSD file, creates masks, preprocesses prompts etc.
     unpacked_layers = []
     global_descriptions = {}
@@ -72,14 +72,15 @@ def unpack_layers(layers):
         pos, neg = splits if len(splits) == 2 else (splits[0], "")
         layermatrix = torch.tensor(np.asarray(layer.topil().getchannel("A"))).float() / 255
         # build tri-level matrices
-        fullmatrix = (layermatrix > 254/255)
-        emptymatrix = (layermatrix < 2/256)
-        middlematrix = ~(fullmatrix | emptymatrix)
-        assert torch.all(torch.ones_like(middlematrix) == (fullmatrix | emptymatrix | middlematrix))
-        assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & emptymatrix))
-        assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & middlematrix))
-        assert torch.all(torch.zeros_like(middlematrix) == (emptymatrix & middlematrix))
-        layermatrix = 0. * emptymatrix.float() + 1. * fullmatrix.float() + 0.5 * middlematrix.float()
+        if trilevel:
+            fullmatrix = (layermatrix > 254/255)
+            emptymatrix = (layermatrix < 2/256)
+            middlematrix = ~(fullmatrix | emptymatrix)
+            assert torch.all(torch.ones_like(middlematrix) == (fullmatrix | emptymatrix | middlematrix))
+            assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & emptymatrix))
+            assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & middlematrix))
+            assert torch.all(torch.zeros_like(middlematrix) == (emptymatrix & middlematrix))
+            layermatrix = 0. * emptymatrix.float() + 1. * fullmatrix.float() + 0.5 * middlematrix.float()
         _layermatrix = layermatrix
         assert layermatrix.size() == (512, 512)
         downsamples = [8, 16, 32, 64]
@@ -92,14 +93,15 @@ def unpack_layers(layers):
         for downsample in downsamples:
             downsampled = torch.nn.functional.avg_pool2d(_layermatrix[None, :, :], downsample, downsample)[0, :, :]
             layermatrix = downsampled
-            fullmatrix = (layermatrix > 254/255)
-            emptymatrix = (layermatrix < 2/256)
-            middlematrix = ~(fullmatrix | emptymatrix)
-            assert torch.all(torch.ones_like(middlematrix) == (fullmatrix | emptymatrix | middlematrix))
-            assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & emptymatrix))
-            assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & middlematrix))
-            assert torch.all(torch.zeros_like(middlematrix) == (emptymatrix & middlematrix))
-            layermatrix = 0. * emptymatrix.float() + 1. * fullmatrix.float() + 0.5 * middlematrix.float()
+            if trilevel:
+                fullmatrix = (layermatrix > 254/255)
+                emptymatrix = (layermatrix < 2/256)
+                middlematrix = ~(fullmatrix | emptymatrix)
+                assert torch.all(torch.ones_like(middlematrix) == (fullmatrix | emptymatrix | middlematrix))
+                assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & emptymatrix))
+                assert torch.all(torch.zeros_like(middlematrix) == (fullmatrix & middlematrix))
+                assert torch.all(torch.zeros_like(middlematrix) == (emptymatrix & middlematrix))
+                layermatrix = 0. * emptymatrix.float() + 1. * fullmatrix.float() + 0.5 * middlematrix.float()
             unpacked_layers[-1][tuple(downsampled.shape)] = layermatrix
 
     return {"layers": unpacked_layers, "global": global_descriptions}
@@ -310,8 +312,8 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
         globalpos = spec["global"]["pos"]
         globalneg = spec["global"]["neg"]
         for layer in spec["layers"]:
-            layer["pos"] += " " + globalpos
-            layer["neg"] += " " + globalneg
+            layer["pos"] += ", " + globalpos
+            layer["neg"] += ", " + globalneg
         spec["layers"] = [self._tokenize_dict(layer) for layer in spec["layers"]]
         ds = spec["layers"]
 
@@ -454,8 +456,9 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
         layers = None, # must be a psd image file
         height: Optional[int] = 512,
         width: Optional[int] = 512,
-        num_inference_steps: int = 50,
+        num_inference_steps: int = 32,
         guidance_scale: float = 7.5,
+        bootstrap_ratio:float=0.4,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
@@ -543,7 +546,7 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-        spec = unpack_layers(layers)
+        spec = unpack_layers(layers, trilevel=False)
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -585,6 +588,7 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
             generator,
             latents,
         )
+        init_noise = latents.clone()
 
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -593,7 +597,29 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
         # 8. Denoising loop
         # Each denoising step also includes refinement of the latents with respect to the
         # views.
+
+        t_tight_bootstrap = int(self.scheduler.num_train_timesteps * (1 - bootstrap_ratio))   # before this timestep, do constant mask like in paper
+        # t_tight_bootstrap = self.scheduler.num_train_timesteps + 1
+
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        #"""
+        object_masks_alphamask = object_masks > 254 / 255
+        current_alphamask = torch.zeros_like(object_masks[-1]).bool()
+        for i in list(range(len(object_masks)))[::-1]:
+            object_masks_alphamask[i] = (object_masks[i] > 0) & (~current_alphamask)
+            current_alphamask = current_alphamask | (object_masks[i] > 254/255)
+        # """
+        """
+        object_masks_alphamask = object_masks
+        current_alphamask = torch.zeros_like(object_masks[-1])
+        for i in list(range(len(object_masks)))[::-1]:
+            object_masks_alphamask[i] = object_masks[i] - current_alphamask
+            current_alphamask = (current_alphamask + object_masks[i]).clamp(0, 1)
+        # """
+
+        bootstrapping_backgrounds = self.get_random_background(20)
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # generate views
@@ -604,6 +630,16 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
 
                 latent_model_input = torch.cat([latents] * len(pos_text_embeds), 0)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                if t.cpu().item() > t_tight_bootstrap:      # do tight masks stuff
+                    # sample random rgb (a different one for each mask?)
+                    latent_bgr = bootstrapping_backgrounds[torch.randint(0, len(bootstrapping_backgrounds), (latent_model_input.size(0),), device=latent_model_input.device)]
+                    latent_bgr = self.scheduler.scale_model_input(latent_bgr, t)
+                    latent_bgr = self.scheduler.add_noise(latent_bgr, init_noise, t)
+                    # prepare unet input by replacing masked regions with corresponding latent_bgr parts
+                    latent_model_input = object_masks_alphamask[:, None].float() * latent_model_input \
+                                        + (1 - object_masks_alphamask[:, None].float()) * latent_bgr
+
                 pos_noise_preds = self.unet(
                         latent_model_input,
                         t,
@@ -627,11 +663,6 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
                 ).prev_sample
 
                 # merge different predictions based on objectmask
-                object_masks_alphamask = object_masks > 254/255
-                current_alphamask = torch.zeros_like(object_masks[-1]).bool()
-                for i in list(range(len(object_masks)))[::-1]:
-                    object_masks_alphamask[i] = (object_masks[i] > 0) & (~current_alphamask)
-                    current_alphamask = current_alphamask | (object_masks[i] > 254/255)
 
                 count = object_masks_alphamask.sum(0)
                 assert torch.all(count > 0)
@@ -661,4 +692,43 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+    # copied from region_control.py
+    @torch.no_grad()
+    def get_random_background(self, n_samples):
+        # sample random background with a constant rgb value
+        backgrounds = torch.rand(n_samples, 3, device=self.device)[:, :, None, None].repeat(1, 1, 512, 512)
+        return torch.cat([self.encode_imgs(bg.unsqueeze(0)) for bg in backgrounds])
+
+    @torch.no_grad()
+    def encode_imgs(self, imgs):
+        imgs = 2 * imgs - 1
+        posterior = self.vae.encode(imgs).latent_dist
+        latents = posterior.sample() * self.vae.config.scaling_factor
+        return latents
+    """
+    @torch.no_grad()
+    def decode_latents(self, latents):
+        latents = 1 / 0.18215 * latents
+        imgs = self.vae.decode(latents).sample
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        return imgs
+    # """
+
+    @torch.no_grad()
+    def get_text_embeds(self, prompt, negative_prompt):
+        # Tokenize text and get embeddings
+        text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
+                                    truncation=True, return_tensors='pt')
+        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+
+        # Do the same for unconditional embeddings
+        uncond_input = self.tokenizer(negative_prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
+                                      return_tensors='pt')
+
+        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+
+        # Cat for final embeddings
+        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+        return text_embeddings
 

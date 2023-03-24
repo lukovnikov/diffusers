@@ -603,12 +603,18 @@ class StableDiffusionPaintbywordsPipeline(DiffusionPipeline):
 
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
-        #"""
-        object_masks_alphamask = object_masks > 254 / 255
+        # remove overlapping regions
+        object_masks_alphamask = object_masks > 0.5
         current_alphamask = torch.zeros_like(object_masks[-1]).bool()
         for i in list(range(len(object_masks)))[::-1]:
             object_masks_alphamask[i] = (object_masks[i] > 0) & (~current_alphamask)
-            current_alphamask = current_alphamask | (object_masks[i] > 254/255)
+            current_alphamask = current_alphamask | (object_masks_alphamask[i])
+        """
+        object_masks_alphamask = object_masks > 0.5
+        current_alphamask = torch.zeros_like(object_masks[-1]).bool()
+        for i in list(range(len(object_masks)))[::-1]:
+            object_masks_alphamask[i] = (object_masks[i] > 0) & (~current_alphamask)
+            current_alphamask = current_alphamask | (object_masks[i] > 0.5)
         # """
         """
         object_masks_alphamask = object_masks

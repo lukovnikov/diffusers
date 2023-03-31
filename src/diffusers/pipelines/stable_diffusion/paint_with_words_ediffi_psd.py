@@ -1,3 +1,9 @@
+import pickle
+
+import os
+
+import shelve
+
 import re
 
 import math
@@ -7,7 +13,7 @@ import numpy as np
 import PIL
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel, DDIMScheduler
 from PIL import Image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPFeatureExtractor
@@ -17,6 +23,8 @@ from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
 
 import psd_tools
+
+from diffusers.pipelines.stable_diffusion.utils import ImgDB
 
 
 def always_round(x):
@@ -253,12 +261,22 @@ def pww_load_tools(
         if _module.__class__.__name__ == "CrossAttention":
             _module.__class__.__call__ = inj_forward
 
+    """
     scheduler = scheduler_type(
         beta_start=0.00085,
         beta_end=0.012,
         beta_schedule="scaled_linear",
         num_train_timesteps=1000,
     )
+    # """
+
+    scheduler = scheduler_type.from_pretrained(
+            model_path,
+            subfolder="scheduler",
+            use_auth_token=model_token,
+            torch_dtype=dtype,
+            local_files_only=local_path_only,
+        )
 
     return vae, unet, text_encoder, tokenizer, scheduler
 
@@ -619,6 +637,14 @@ def paint_with_words(
 
     # old code below:
     scheduler.set_timesteps(num_inference_steps)
+    if not isinstance(scheduler, LMSDiscreteScheduler):
+        # print("Using custom sigmas")
+        sigmas = np.array(((1 - scheduler.alphas_cumprod) / scheduler.alphas_cumprod) ** 0.5)
+        sigmas = sigmas[scheduler.timesteps]
+        sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
+        sigmas = torch.from_numpy(sigmas)
+        scheduler.sigmas = sigmas
+
     if init_image is None:
         timesteps = scheduler.timesteps
     else:
@@ -1035,17 +1061,86 @@ class PaintWithWord_StableDiffusionPipeline(StableDiffusionPipeline):
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
 
-if __name__ == '__main__':
+def run_ediffi(filepath, strength=1.2, sigma_square=True, qk_std=True, N=5, tools=None):
+    ediffi_imgs = []
+    print(f"Running original ediffi")
+    for seed in seeds[:N]:
+        img = paint_with_words(
+            specfile=filepath,
+            num_inference_steps=50,
+            guidance_scale=7.5,
+            device="cuda:0",
+            seed=seed,
+            weight_function=lambda w, sigma, qk: strength * w * math.log(
+                1 + (sigma ** 2 if sigma_square else sigma)) * (qk.std() if qk_std else qk.max()),
+            preloaded_utils=tools,
+        )
+        ediffi_imgs.append({"seed": seed, "img": img})
+    return ediffi_imgs
 
-    img = paint_with_words(
-        specfile="images/test_image.psd",
-        num_inference_steps=30,
-        guidance_scale=7.5,
+
+if __name__ == '__main__':
+    filepath = "images/rabbitfire2.psd"         # <-- different regions are equally weighted
+    seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
+
+    # imgdb = ImgDB(path="imgdb_ediffi.json")
+
+    modelname = "runwayml/stable-diffusion-v1-5"
+    tools_ediffi = pww_load_tools(
         device="cuda:0",
-        # hf_model_path="runwayml/stable-diffusion-v1-5",
-        seed=420,
-        weight_function=lambda w, sigma, qk: 1.8 * w * math.log(1 + sigma**2) * qk.std(),
+        scheduler_type=DDIMScheduler,
+        hf_model_path=modelname,
+        model_token=None,
     )
 
-    img = np.array(img)[:,:,::-1]
-    print(img)
+    images = []
+    savepath = "images_ediffi.pkl"
+    if os.path.exists(savepath):
+        with open(savepath, "rb") as f:
+            images = pickle.load(f)
+            print(f"Using existing images {savepath} of length {len(images)}")
+
+    for sigma_square in [True, False]:
+        for qk_std in [True, False]:
+            cs = []
+            if sigma_square and qk_std:
+                cs = [0, 1.25, 1.5, 1.75, 2.1, 2.5, 2.75, 3., 3.5] # [0., 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 3.5, 4]
+            if not sigma_square and qk_std:
+                cs = [2.25, 2.5, 3., 3.5, 4, 4.5, 5, 6] # [0., 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 3, 3.5, 4]
+            if not sigma_square and not qk_std:
+                cs = [0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8]  # [0., 0.1, 0.15, 0.2, 0.25, 0.3, 0.325, 0.35, 0.375, 0.4, 0.45, 0.5, 1]
+            for c in cs:
+                print(f"sigma_square={sigma_square}, qk_std={qk_std}, c={c}")
+                outputs = run_ediffi(filepath, strength=c, sigma_square=sigma_square, qk_std=qk_std, N=5, tools=tools_ediffi)# len(seeds))
+                # image_grid([o["img"] for o in outputs], len(outputs))
+                for o in outputs:
+                    o.update({"sigma_square": sigma_square,
+                              "qk_std": qk_std,
+                              "inputfile": filepath,
+                              "c": c,
+                              "method": "ediffi",
+                              "modelname": modelname,
+                              "scheduler": "ddim"})
+                    images.append(o)
+
+                print("saving to pickle")
+                with open(savepath, "wb") as f:
+                    pickle.dump(images, f)
+
+
+
+
+    #
+    # img = paint_with_words(
+    #     specfile="images/test_image.psd",
+    #     num_inference_steps=30,
+    #     guidance_scale=7.5,
+    #     device="cuda:0",
+    #     # hf_model_path="runwayml/stable-diffusion-v1-5",
+    #     scheduler_type=DDIMScheduler,
+    #     seed=420,
+    #     weight_function=lambda w, sigma, qk: 1.8 * w * math.log(1 + sigma**2) * qk.std(),
+    # )
+    #
+    # img = np.array(img)[:,:,::-1]
+    # print(img)

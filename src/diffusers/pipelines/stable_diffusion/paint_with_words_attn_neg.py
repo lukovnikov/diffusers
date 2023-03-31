@@ -1,8 +1,6 @@
-import os
-
 import pickle
 
-import shelve
+import os
 
 from functools import partial
 
@@ -25,8 +23,6 @@ from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
 
 import psd_tools
-
-from diffusers.pipelines.stable_diffusion.utils import ImgDB
 
 
 def always_round(x):
@@ -155,6 +151,7 @@ def inj_forward(self, hidden_states, encoder_hidden_states=None, attention_mask=
     attention_scores = torch.matmul(query, key.transpose(-1, -2))
 
     attention_size_of_img = attention_scores.shape[-2]
+    w = None
     if context is not None:
         if is_dict_format:
             f: Callable = context["WEIGHT_FUNCTION"]
@@ -179,9 +176,19 @@ def inj_forward(self, hidden_states, encoder_hidden_states=None, attention_mask=
     else:
         cross_attention_weight = 0.0
 
-    attention_scores = (attention_scores + cross_attention_weight) * self.scale
+    attention_scores = attention_scores * self.scale
+    # if w is not None:       # TODO: something wrong here
+    #     # compute time step weights and multiply
+    #     timestep_weights = w.max(0)[0][None]
+    #     timestep_weights = torch.where(timestep_weights == 0, torch.ones_like(timestep_weights) , timestep_weights)
+    #     attention_scores = attention_scores + timestep_weights * attention_scores.max(0)[0][None]
 
     attention_probs = attention_scores.softmax(dim=-1)
+
+    if cross_attention_weight > 0.:
+        masked_attention_scores = attention_scores + torch.log(w >= 0.999)
+        masked_attention_probs = masked_attention_scores.softmax(dim=-1)
+        _attention_probs = cross_attention_weight * masked_attention_probs + (1 - cross_attention_weight) * attention_probs
 
     hidden_states = torch.matmul(attention_probs, value)
 
@@ -1056,7 +1063,7 @@ class PaintWithWord_StableDiffusionPipeline(StableDiffusionPipeline):
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
 
-def default_attn_pos_weight_fn(w, progress, qk, threshold=0.4, mult=1.):
+def default_attn_neg_weight_fn(w, progress, qk, threshold=0.4, mult=1.):
     a, b = threshold, None
     if isinstance(threshold, tuple) and len(threshold) == 2:
         a = min(threshold)
@@ -1071,12 +1078,19 @@ def default_attn_pos_weight_fn(w, progress, qk, threshold=0.4, mult=1.):
     else:
         weight = 0
 
-    wprime = w * (1 + weight * qk.max() * mult)
-    return wprime
+    # wdiff = (w - 1).clamp_min(0.)
+    # wprime = w.clamp(mult + (1 - weight) * (1 - mult), 1.) + weight * wdiff
+    _w = w / w.max(0)[0][None].clamp_min(1e-6)
+    wprime = _w.clamp(mult + (1 - weight) * (1 - mult), 1.)
+    # if w.size(0) == 4096 and weight < 1.:
+    #     x = torch.cat((wprime/wprime.max()).view(64,64, -1)[:, :, :20].unbind(-1), 1).cpu().numpy()
+    #     z = wprime.max(), wprime.min()
+    #     y = None
+    return weight
 
 
-def run_pos(filepath, threshold_start=0.2, threshold_end=0.6, mult=1.2, N=5, device=1, tools=None):
-    pos_imgs = []
+def run_neg(filepath, threshold_start=0.2, threshold_end=0.6, mult=1.2, N=5, device=1, tools=None):
+    imgs = []
     print(f"Running positive")
     for seed in seeds[:N]:
         img = paint_with_words(
@@ -1085,47 +1099,56 @@ def run_pos(filepath, threshold_start=0.2, threshold_end=0.6, mult=1.2, N=5, dev
             guidance_scale=7.5,
             device=f"cuda:{device}",
             seed=seed,
-            weight_function=partial(default_attn_pos_weight_fn, threshold=(threshold_start, threshold_end), mult=mult),
+            weight_function=partial(default_attn_neg_weight_fn, threshold=(threshold_start, threshold_end), mult=mult),
             preloaded_utils=tools,
         )
-        pos_imgs.append({"img": img, "seed": seed})
-    return pos_imgs
+        imgs.append({"img": img, "seed": seed})
+    return imgs
 
 
 if __name__ == '__main__':
-    device = 2
 
-    filepath = "images/rabbitfire2.psd"
+    # TODO: assign uncovered tokens to background
+    # TODO: take care of custom word weights (how does automatic1111 do it?)
+    # TODO: what about more continuous masks with gradations between 0 and 1
+    # TODO: implement three thresholds:
+    #           - bring back all tokens (even from competing regions)
+    #           - bring back start token
+    #           - bring back end token
+    #       and experiment with bringing back only start and/or end token instead of all tokens
+
+
+    device = 1
+
+    filepath = "images/rabbitfire.psd"
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
 
     modelname = "runwayml/stable-diffusion-v1-5"
-    tools_pos = pww_load_tools(
-        device=f"cuda:{device}",
-        scheduler_type=DDIMScheduler,
-        hf_model_path=modelname,
-        model_token=None,
-    )
+    tools = pww_load_tools(
+            device=f"cuda:{device}",
+            scheduler_type=DDIMScheduler,
+            hf_model_path="runwayml/stable-diffusion-v1-5",
+            model_token=None,
+        )
 
     images = []
-    savepath = "images_posattn.pkl"
+    savepath = "images_negattn.pkl"
     if os.path.exists(savepath):
         with open(savepath, "rb") as f:
             images = pickle.load(f)
             print(f"Using existing images {savepath} of length {len(images)}")
 
-    for a in [0.2, 0., 0.1, 0.4, 0.7]:
+    for a in [0.2, 0., 0.1, 0.3, 0.4, 0.5, 0.7]:
         ls = [0.3, 0.01, 0.15, 0.4, 0.7]
         if a == 0.7:
             ls = [0.01, 0.2]
         for l in ls:
             if l + a >= 1.:
                 continue
-            cs = [0., 0.4, 0.75, 1., 1.25, 1.5, 2., 4, 8]
-            if a == 0.7:
-                cs = [0.4, 0.5, 0.7]
+            cs = [0., 0.1, 0.2]
             for c in cs:
                 print(f"a={a}, l={l}, c={c}")
-                outputs = run_pos(filepath, threshold_start=a, threshold_end=a + l, mult=c, N=5, device=device, tools=tools_pos) # len(seeds))
+                outputs = run_neg(filepath, threshold_start=a, threshold_end=a + l, mult=c, N=5, device=device, tools=tools) # len(seeds))
                 #display(image_grid([o["img"] for o in outputs], len(outputs)))
                 for o in outputs:
                     o.update({"threshold_start": a,
@@ -1140,30 +1163,5 @@ if __name__ == '__main__':
                 print("saving to pickle")
                 with open(savepath, "wb") as f:
                     pickle.dump(images, f)
-
-
-
-    # tools = pww_load_tools(
-    #         device="cuda:0",
-    #         scheduler_type=DDIMScheduler,
-    #         hf_model_path="runwayml/stable-diffusion-v1-5",
-    #         model_token=None,
-    #     )
-    # seeds = [42, 420, 426, 123, 68, 79, 1337, 234]
-    # imgs = []
-    # for seed in seeds:
-    #     img = paint_with_words(
-    #         specfile="images/rabbitfire.psd",
-    #         num_inference_steps=50,
-    #         guidance_scale=7.5,
-    #         device="cuda:0",
-    #         seed=seed,
-    #         weight_function=partial(default_attn_pos_weight_fn, threshold=(0.2, 0.3), mult=1.),
-    #         preloaded_utils=tools,
-    #     )
-    #     imgs.append(img)
-    # img = image_grid(imgs, 4)
-    # img = np.array(img)[:,:,::-1]
-    # print(img)
 
 

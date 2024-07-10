@@ -245,6 +245,7 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         encoder_hidden_states: torch.FloatTensor = None,
         pooled_projections: torch.FloatTensor = None,
         timestep: torch.LongTensor = None,
+        attention_mask:torch.BoolTensor=None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
@@ -311,12 +312,13 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                     hidden_states,
                     encoder_hidden_states,
                     temb,
+                    attention_mask=attention_mask,
                     **ckpt_kwargs,
                 )
 
             else:
                 encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb
+                    hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb, attention_mask=attention_mask
                 )
 
         hidden_states = self.norm_out(hidden_states, temb)

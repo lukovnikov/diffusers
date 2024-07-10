@@ -157,7 +157,7 @@ class JointTransformerBlock(nn.Module):
         self._chunk_dim = dim
 
     def forward(
-        self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor
+        self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor, attention_mask=None
     ):
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
 
@@ -170,7 +170,7 @@ class JointTransformerBlock(nn.Module):
 
         # Attention.
         attn_output, context_attn_output = self.attn(
-            hidden_states=norm_hidden_states, encoder_hidden_states=norm_encoder_hidden_states
+            hidden_states=norm_hidden_states, encoder_hidden_states=norm_encoder_hidden_states, attention_mask=attention_mask
         )
 
         # Process attention outputs for the `hidden_states`.
